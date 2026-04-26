@@ -13,17 +13,23 @@ No data leaves your machine. This is 100% local. We promise.
 (Unlike that npm package you installed at 2am without reading.)
 """
 
+from __future__ import annotations
+
 import os
+import re
 import sys
+import time
+import json
+import glob
+import random
 import shutil
 import platform
 import subprocess
-import glob
-import re
-import time
-import random
+from collections import deque
+from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ANSI COLOR CODES
@@ -53,10 +59,201 @@ HOME = Path.home()
 SYSTEM = platform.system()  # 'Windows', 'Darwin', 'Linux'
 
 
+def _force_utf8_stdio() -> None:
+    """Windows consoles default to cp1252, which mangles the emoji-heavy output.
+    Force UTF-8 so the banner doesn't blow up on first print."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+_force_utf8_stdio()
+
+
+def is_windows() -> bool:
+    return SYSTEM == "Windows"
+
+
+def is_macos() -> bool:
+    return SYSTEM == "Darwin"
+
+
+def is_linux() -> bool:
+    return SYSTEM == "Linux"
+
+
+def is_wsl() -> bool:
+    if not is_linux():
+        return False
+
+    if os.environ.get("WSL_INTEROP") or os.environ.get("WSL_DISTRO_NAME"):
+        return True
+
+    kernel_release = run("uname -r").lower()
+    if "microsoft" in kernel_release or "wsl" in kernel_release:
+        return True
+
+    proc_version = read_file_safe("/proc/version").lower()
+    return "microsoft" in proc_version or "wsl" in proc_version
+
+
+def _within_depth(path: Path, root: Path, max_depth: int) -> bool:
+    try:
+        return len(path.relative_to(root).parts) <= max_depth
+    except Exception:
+        return False
+
+
+def find_paths_under(root: Path, pattern: str, *, directories: Optional[bool] = None, max_depth: int = 5, limit: int = 50) -> List[str]:
+    results: List[str] = []
+    try:
+        for path in root.rglob(pattern):
+            if directories is True and not path.is_dir():
+                continue
+            if directories is False and not path.is_file():
+                continue
+            if not _within_depth(path, root, max_depth):
+                continue
+
+            results.append(str(path))
+            if len(results) >= limit:
+                break
+    except Exception:
+        pass
+    return results
+
+
+def find_node_modules(max_depth: int = 4, limit: int = 40, time_budget: float = 1.5) -> List[str]:
+    """Find node_modules directories quickly without traversing huge trees forever."""
+    results: List[str] = []
+    skip_dirs = {
+        ".git", ".cache", ".venv", "venv", "env", "dist", "build", "out",
+        "Library", "Caches", "Temp", "tmp", "node_modules", "AppData",
+    }
+
+    start = time.monotonic()
+    queue = deque([(HOME, 0)])
+
+    while queue and len(results) < limit:
+        if time.monotonic() - start > time_budget:
+            break
+
+        current, depth = queue.popleft()
+        if depth > max_depth:
+            continue
+
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    if entry.name in skip_dirs:
+                        continue
+                    try:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
+
+                    entry_path = Path(entry.path)
+                    if entry.name == "node_modules":
+                        results.append(str(entry_path))
+                        if len(results) >= limit:
+                            break
+                        continue
+
+                    if depth + 1 <= max_depth:
+                        queue.append((entry_path, depth + 1))
+        except (PermissionError, FileNotFoundError, NotADirectoryError, OSError):
+            continue
+
+    return results
+
+
+def scan_project_markers(max_depth: int = 5, time_budget: float = 1.5) -> Dict[str, int]:
+    """Collect project-related files in one bounded walk instead of three separate scans."""
+    counts = {
+        "makefile": 0,
+        "justfile": 0,
+        "cargo_toml": 0,
+        "nix": 0,
+    }
+    skip_dirs = {
+        ".git", ".cache", ".venv", "venv", "env", "dist", "build", "out",
+        "Library", "Caches", "Temp", "tmp", "node_modules", "AppData",
+    }
+
+    start = time.monotonic()
+    queue = deque([(HOME, 0)])
+    scanned_entries = 0
+
+    while queue:
+        if time.monotonic() - start > time_budget:
+            break
+
+        current, depth = queue.popleft()
+        if depth > max_depth:
+            continue
+
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    scanned_entries += 1
+                    if scanned_entries > 4000:
+                        return counts
+
+                    name_lower = entry.name.lower()
+                    if name_lower in skip_dirs:
+                        continue
+
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if depth + 1 <= max_depth:
+                                queue.append((Path(entry.path), depth + 1))
+                            continue
+                    except OSError:
+                        continue
+
+                    if name_lower == "makefile":
+                        counts["makefile"] += 1
+                    elif name_lower == "justfile":
+                        counts["justfile"] += 1
+                    elif name_lower == "cargo.toml":
+                        counts["cargo_toml"] += 1
+                    elif name_lower.endswith(".nix"):
+                        counts["nix"] += 1
+        except (PermissionError, FileNotFoundError, NotADirectoryError, OSError):
+            continue
+
+    return counts
+
+
+def host_label() -> str:
+    if is_wsl():
+        return "WSL"
+    return SYSTEM
+
+
+def match_any(text: str, needles: Tuple[str, ...]) -> bool:
+    return any(needle in text for needle in needles)
+
+
+def read_linux_distro() -> str:
+    try:
+        distro_info = Path("/etc/os-release").read_text(errors="ignore")
+        for line in distro_info.split("\n"):
+            if line.startswith("PRETTY_NAME="):
+                return line.split("=", 1)[1].strip().strip('"')
+    except Exception:
+        pass
+    return "Linux (unknown distro)"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # UTILITY FUNCTIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
+@lru_cache(maxsize=None)
 def cmd_exists(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
@@ -89,24 +286,21 @@ def count_files_in(path: str, pattern: str = "*") -> int:
     except Exception:
         return 0
 
-def find_node_modules() -> List[str]:
-    """Find node_modules directories under home (limit scan depth to 5)."""
-    found = []
-    try:
-        result = run(f'find "{HOME}" -maxdepth 5 -name "node_modules" -type d 2>/dev/null', timeout=10)
-        if result:
-            found = [l for l in result.split("\n") if l.strip()]
-    except Exception:
-        pass
-    return found[:50]  # cap at 50 results
-
 def get_shell_rc_files() -> List[Path]:
-    candidates = [
-        HOME / ".bashrc", HOME / ".bash_profile", HOME / ".profile",
-        HOME / ".zshrc", HOME / ".zprofile",
-        HOME / ".fishrc", HOME / ".config" / "fish" / "config.fish",
-        HOME / ".tcshrc", HOME / ".cshrc",
-    ]
+    if is_windows():
+        candidates = [
+            HOME / "Documents" / "PowerShell" / "Microsoft.PowerShell_profile.ps1",
+            HOME / "Documents" / "PowerShell" / "profile.ps1",
+            HOME / "Documents" / "WindowsPowerShell" / "Microsoft.PowerShell_profile.ps1",
+            HOME / "Documents" / "WindowsPowerShell" / "profile.ps1",
+        ]
+    else:
+        candidates = [
+            HOME / ".bashrc", HOME / ".bash_profile", HOME / ".profile",
+            HOME / ".zshrc", HOME / ".zprofile",
+            HOME / ".fishrc", HOME / ".config" / "fish" / "config.fish",
+            HOME / ".tcshrc", HOME / ".cshrc",
+        ]
     return [p for p in candidates if p.exists()]
 
 def read_file_safe(path) -> str:
@@ -138,96 +332,101 @@ class DevScanner:
     def warn(self, msg: str):
         self.warnings.append(msg)
 
+    def has(self, *commands: str) -> bool:
+        return any(cmd_exists(command) for command in commands)
+
+    def apply_rules(self, rules: List[Tuple[Tuple[str, ...], int, str, str]], collector: Optional[List[str]] = None):
+        for commands, points, emoji, msg in rules:
+            command_tuple = (commands,) if isinstance(commands, str) else commands
+            if self.has(*command_tuple):
+                if points >= 0:
+                    self.award(points, emoji, msg)
+                else:
+                    self.penalize(abs(points), emoji, msg)
+                if collector is not None:
+                    collector.append(command_tuple[0])
+
+    def first_available(self, commands: Tuple[str, ...]) -> Optional[str]:
+        for command in commands:
+            if cmd_exists(command):
+                return command
+        return None
+
     # ── TIER 1: COMMON — Basic signs of life ──────────────────────────────
 
     def check_os(self):
         """OS choice is the OG developer personality test."""
-        distro = ""
-        if SYSTEM == "Windows":
-            wsl = run("wsl --list 2>/dev/null")
-            if wsl:
+        if is_windows():
+            wsl = run("wsl.exe -l -q 2>&1") or run("wsl.exe --status 2>&1")
+            if wsl.strip():
                 self.award(8, "🪟", f"Windows detected... but at least you have WSL (Windows Suffering Layer). Respect.")
                 self.profile["os"] = "windows_wsl"
             else:
                 self.penalize(20, "🪟", f"Windows detected without WSL. Absolute proprietary slop.")
                 self.profile["os"] = "windows"
                 self.warn("Uses Windows without WSL. node_modules folder is basically a black hole.")
-        elif SYSTEM == "Darwin":
+        elif is_macos():
             mac_ver = platform.mac_ver()[0]
             self.award(5, "🍎", f"macOS {mac_ver}. A developer OR a designer who opened Terminal once.")
             self.profile["os"] = "macos"
-        elif SYSTEM == "Linux":
-            kernel_release = run("uname -r").lower()
-            if "microsoft" in kernel_release or "wsl" in kernel_release:
+        elif is_linux():
+            if is_wsl():
                 self.award(8, "🪟", "WSL detected! Windows on the outside, Linux on the inside.")
                 self.profile["os"] = "wsl"
                 return
 
-            try:
-                distro_info = Path("/etc/os-release").read_text(errors="ignore")
-                for line in distro_info.split("\n"):
-                    if line.startswith("PRETTY_NAME="):
-                        distro = line.split("=", 1)[1].strip().strip('"')
-                        break
-            except Exception:
-                distro = "Linux (unknown distro)"
-
+            distro = read_linux_distro()
             distro_lower = distro.lower()
-            if "arch" in distro_lower:
-                self.award(25, "🏹", f"Arch Linux! Don't worry, we already know. You've told everyone.")
-                self.profile["os"] = "arch"
-            elif "gentoo" in distro_lower:
-                self.award(40, "🔮", f"Gentoo! You compile everything from source including your morning coffee.")
-                self.profile["os"] = "gentoo"
-            elif "nix" in distro_lower or file_exists("/etc/nixos"):
-                self.award(35, "❄️",  f"NixOS detected. Your system.nix is longer than most novels.")
-                self.profile["os"] = "nixos"
-            elif "bsd" in distro_lower or SYSTEM == "FreeBSD":
-                self.award(45, "🦌", f"BSD! You are either very wise or very lost. Possibly both.")
-                self.profile["os"] = "bsd"
-            elif "ubuntu" in distro_lower:
-                self.award(10, "🐧", f"{distro}. The 'I use Linux btw' starter pack. Comfortable.")
-                self.profile["os"] = "ubuntu"
-            elif "debian" in distro_lower:
-                self.award(12, "🌀", f"Debian. Stable. Boring. Like you. (Compliment.)")
-                self.profile["os"] = "debian"
-            elif "fedora" in distro_lower:
-                self.award(14, "🎩", f"Fedora. For people who want Arch clout but also want their GPU drivers to work.")
-                self.profile["os"] = "fedora"
-            elif "mint" in distro_lower:
-                self.award(8,  "🌿", f"Linux Mint. You showed your friend and said 'Linux is easy!'")
-                self.profile["os"] = "mint"
-            elif "kali" in distro_lower:
-                self.penalize(10, "💀", f"Kali Linux as a daily driver. Peak script-kiddie cringe.")
-                self.profile["os"] = "kali"
-            elif "pop" in distro_lower:
-                self.award(11, "🚀", f"Pop!_OS. For gamers who want to feel like real developers.")
-                self.profile["os"] = "pop_os"
-            else:
-                self.award(15, "🐧", f"Linux ({distro}). Exotic taste. Respect.")
-                self.profile["os"] = "linux_other"
+            linux_rules = [
+                (lambda: match_any(distro_lower, ("arch",)), 25, "🏹", "arch", f"Arch Linux! Don't worry, we already know. You've told everyone."),
+                (lambda: match_any(distro_lower, ("gentoo",)), 40, "🔮", "gentoo", f"Gentoo! You compile everything from source including your morning coffee."),
+                (lambda: match_any(distro_lower, ("nix",)) or file_exists("/etc/nixos"), 35, "❄️", "nixos", f"NixOS detected. Your system.nix is longer than most novels."),
+                (lambda: match_any(distro_lower, ("bsd",)) or SYSTEM == "FreeBSD", 45, "🦌", "bsd", f"BSD! You are either very wise or very lost. Possibly both."),
+                (lambda: match_any(distro_lower, ("ubuntu",)), 10, "🐧", "ubuntu", f"{distro}. The 'I use Linux btw' starter pack. Comfortable."),
+                (lambda: match_any(distro_lower, ("debian",)), 12, "🌀", "debian", f"Debian. Stable. Boring. Like you. (Compliment.)"),
+                (lambda: match_any(distro_lower, ("fedora",)), 14, "🎩", "fedora", f"Fedora. For people who want Arch clout but also want their GPU drivers to work."),
+                (lambda: match_any(distro_lower, ("mint",)), 8, "🌿", "mint", f"Linux Mint. You showed your friend and said 'Linux is easy!'"),
+                (lambda: match_any(distro_lower, ("kali",)), -10, "💀", "kali", f"Kali Linux as a daily driver. Peak script-kiddie cringe."),
+                (lambda: match_any(distro_lower, ("pop",)), 11, "🚀", "pop_os", f"Pop!_OS. For gamers who want to feel like real developers."),
+            ]
+
+            for matches, pts, emoji, profile, msg in linux_rules:
+                if matches():
+                    if pts >= 0:
+                        self.award(pts, emoji, msg)
+                    else:
+                        self.penalize(abs(pts), emoji, msg)
+                    self.profile["os"] = profile
+                    return
+
+            self.award(15, "🐧", f"Linux ({distro}). Exotic taste. Respect.")
+            self.profile["os"] = "linux_other"
 
     def check_shell(self):
         """Your shell is your personality."""
         shell = os.environ.get("SHELL", "")
         shell_lower = shell.lower()
-        if "fish" in shell_lower:
-            self.award(14, "🐟", "Fish shell! You love autocomplete more than you love documentation.")
-        elif "zsh" in shell_lower:
-            self.award(10, "⚡", "Zsh. The trendy shell. Instagram of shells.")
-        elif "bash" in shell_lower:
-            self.award(4,  "💥", "Bash. Classic. Like cargo shorts. Functional, not fashionable.")
-        elif "dash" in shell_lower:
-            self.award(20, "⚡", "Dash! Minimal. POSIX purist. You probably hate bash for 'bloat'.")
-        elif "tcsh" in shell_lower or "csh" in shell_lower:
-            self.award(8,  "🦕", "C shell. You either work in academia or time-traveled from 1985.")
-        elif "pwsh" in shell_lower or "powershell" in shell_lower:
-            self.award(3,  "💙", "PowerShell. You're doing your best. We respect the hustle.")
-        elif "cmd" in shell_lower:
-            self.penalize(15, "☠️",  "CMD.exe as primary shell. Pure, unfiltered suffering.")
-            self.warn("CMD as primary shell. Sir, this is a Wendy's.")
-        elif shell:
-            self.award(12, "🔮", f"Custom shell: {shell}. Mysterious. We like it.")
+        shell_rules = [
+            (("fish",), 14, "🐟", "Fish shell! You love autocomplete more than you love documentation."),
+            (("zsh",), 10, "⚡", "Zsh. The trendy shell. Instagram of shells."),
+            (("bash",), 4, "💥", "Bash. Classic. Like cargo shorts. Functional, not fashionable."),
+            (("dash",), 20, "⚡", "Dash! Minimal. POSIX purist. You probably hate bash for 'bloat'."),
+            (("tcsh", "csh"), 8, "🦕", "C shell. You either work in academia or time-traveled from 1985."),
+            (("pwsh", "powershell"), 3, "💙", "PowerShell. You're doing your best. We respect the hustle."),
+            (("cmd",), -15, "☠️", "CMD.exe as primary shell. Pure, unfiltered suffering."),
+        ]
+
+        for needles, pts, emoji, msg in shell_rules:
+            if match_any(shell_lower, needles):
+                if pts >= 0:
+                    self.award(pts, emoji, msg)
+                else:
+                    self.penalize(abs(pts), emoji, msg)
+                    self.warn("CMD as primary shell. Sir, this is a Wendy's.")
+                break
+        else:
+            if shell:
+                self.award(12, "🔮", f"Custom shell: {shell}. Mysterious. We like it.")
         self.profile["shell"] = shell
 
     def check_editor_of_choice(self):
@@ -308,14 +507,16 @@ class DevScanner:
     def check_package_managers(self):
         """Package managers: the measure of a developer's chaos."""
         pms = []
-        
-        if cmd_exists("snap"):
-            self.penalize(15, "🐌", "Snap daemon found. Canonical's sluggish proprietary slop.")
-            pms.append("snap")
-            
-        if cmd_exists("flatpak"):
-            self.award(5, "📦", "Flatpak. The acceptable, modern way to sandbox desktop apps.")
-            pms.append("flatpak")
+        self.apply_rules([
+            (("snap",), -15, "🐌", "Snap daemon found. Canonical's sluggish proprietary slop."),
+            (("flatpak",), 5, "📦", "Flatpak. The acceptable, modern way to sandbox desktop apps."),
+            (("nix", "nix-env"), 20, "❄️", "Nix package manager! You hate state and love reproducing builds from 2019."),
+            (("apt", "apt-get"), 2, "📦", "APT package manager (Debian/Ubuntu). Stable and standard."),
+            (("pacman",), 10, "👻", "Pacman! You are one 'yay -Syu' away from an existential crisis."),
+            (("yay", "paru"), 8, "🏹", "AUR helper detected! You install software that 3 people maintain from their basement."),
+            (("emerge",), 30, "🔮", "Portage/emerge! You compile packages during lunch. You are Gentoo."),
+            (("cargo",), 12, "🦀", "Cargo installed! You've mentioned Rust at least 7 times this week."),
+        ], pms)
 
         if cmd_exists("brew"):
             pkgs = run("brew list --formula 2>/dev/null | wc -l").strip()
@@ -331,32 +532,8 @@ class DevScanner:
                 self.award(3, "🍺", "Homebrew found. The gateway drug to Linux.")
             pms.append("brew")
 
-        if cmd_exists("nix") or cmd_exists("nix-env"):
-            self.award(20, "❄️",  "Nix package manager! You hate state and love reproducing builds from 2019.")
-            pms.append("nix")
-
-        if cmd_exists("apt") or cmd_exists("apt-get"):
-            self.award(2,  "📦", "APT package manager (Debian/Ubuntu). Stable and standard.")
-            pms.append("apt")
-
-        if cmd_exists("pacman"):
-            self.award(10, "👻", "Pacman! You are one 'yay -Syu' away from an existential crisis.")
-            pms.append("pacman")
-
-        if cmd_exists("yay") or cmd_exists("paru"):
-            self.award(8, "🏹", "AUR helper detected! You install software that 3 people maintain from their basement.")
-            pms.append("aur_helper")
-
-        if cmd_exists("emerge"):
-            self.award(30, "🔮", "Portage/emerge! You compile packages during lunch. You are Gentoo.")
-            pms.append("portage")
-
-        if cmd_exists("cargo"):
-            self.award(12, "🦀", "Cargo installed! You've mentioned Rust at least 7 times this week.")
-            pms.append("cargo")
-
-        if cmd_exists("npm") or cmd_exists("pnpm") or cmd_exists("yarn") or cmd_exists("bun"):
-            tools = [t for t in ["npm", "pnpm", "yarn", "bun"] if cmd_exists(t)]
+        tools = [t for t in ["npm", "pnpm", "yarn", "bun"] if cmd_exists(t)]
+        if tools:
             if len(tools) > 2:
                 self.award(4,  "😵", f"Multiple JS package managers: {', '.join(tools)}. Pick a lane.")
             else:
@@ -372,54 +549,41 @@ class DevScanner:
         # Note: Compilers and low level tools removed from this list to avoid double counting!
         langs = []
         
-        # Penalties for slop languages
-        bad_langs = {
-            "php":    (10, "🐘", "PHP. The language of legacy WordPress slop."),
-            "java":   (5,  "☕", "Java. Enterprise boilerplate factory."),
-            "matlab": (15, "📉", "MATLAB. Paying for an array index that starts at 1."),
-        }
-        for cmd, (pts, emoji, label) in bad_langs.items():
-            if cmd_exists(cmd):
-                self.penalize(pts, emoji, f"{label} installed.")
-                langs.append(cmd)
-                
-        # Good/Neutral languages
-        lang_checks = {
-            "python3":    (2,  "🐍", "Python 3. Standard issue."),
-            "node":       (3,  "💚", "Node.js"),
-            "deno":       (8,  "🦕", "Deno (you said 'npm is too mainstream')"),
-            "bun":        (7,  "🐢", "Bun.js (you're always chasing the next hotness)"),
-            "ruby":       (3,  "💎", "Ruby. Found everywhere, loved by some."),
-            "perl":       (2,  "🔮", "Perl! It's preinstalled, but maybe you actually use it."),
-            "kotlin":     (8,  "🅺", "Kotlin. You graduated from Java and feel smug about it."),
-            "scala":      (15, "⚡", "Scala. You work at a bank or a startup that thinks it's a bank."),
-            "swift":      (8,  "🍎", "Swift. You have $99/year opinions."),
-            "rustc":      (15, "🦀", "Rust compiler! Memory safety AND superiority complex."),
-            "go":         (10, "🐹", "Go. You value simplicity over expressiveness."),
-            "elixir":     (18, "💧", "Elixir! Pattern matching and 'fault tolerant' everything."),
-            "erlang":     (22, "📡", "Erlang! You were doing distributed computing before it was cool."),
-            "clojure":    (20, "🧠", "Clojure! Lisp in the JVM. Peak smug."),
-            "ocaml":      (22, "🐪", "OCaml! You either do formal verification or competitive programming."),
-            "zig":        (25, "⚡", "Zig! You read the Zig docs for fun. On weekends."),
-            "lua":        (10, "🌙", "Lua! Neovim plugin dev or game scripting. Respected."),
-            "r":          (10, "📊", "R. You either do data science or biostatistics. Crying either way."),
-            "julia":      (18, "📐", "Julia! Fast and beautiful. Nobody around you knows it exists."),
-            "nim":        (25, "👁️",  "Nim! 12 people use this and you're one of them. Elite club."),
-            "crystal":    (22, "💎", "Crystal! Ruby vibes, C performance. Niche and proud."),
-            "dart":       (8,  "🎯", "Dart. Flutter dev or Google employee."),
-            "groovy":     (8,  "🎸", "Groovy. Jenkins pipeline victim."),
-            "tcl":        (18, "🐍", "Tcl! You are from a different timeline entirely."),
-            "sbcl":       (28, "λ",  "Common Lisp (SBCL)! Parentheses all the way down."),
-            "racket":     (20, "🎾", "Racket! You took a PL theory class and never recovered."),
-            "fortran":    (30, "🦕", "Fortran! You are either 80 years old or doing numerical computing."),
-            "cobol":      (35, "🏦", "COBOL! Banks pay you more than God."),
-            "ada":        (30, "✈️",  "Ada! Aviation? Defense? You care if planes stay in the sky."),
-            "fpc":        (22, "🎠", "Pascal/FPC! Legendary. Nostalgic. Chaotic."),
-        }
-        for cmd, (pts, emoji, label) in lang_checks.items():
-            if cmd_exists(cmd):
-                self.award(pts, emoji, f"{label} installed.")
-                langs.append(cmd)
+        self.apply_rules([
+            (("php",), -10, "🐘", "PHP. The language of legacy WordPress slop. installed."),
+            (("java",), -5, "☕", "Java. Enterprise boilerplate factory. installed."),
+            (("matlab",), -15, "📉", "MATLAB. Paying for an array index that starts at 1. installed."),
+            (("python3",), 2, "🐍", "Python 3. Standard issue. installed."),
+            (("node",), 3, "💚", "Node.js installed."),
+            (("deno",), 8, "🦕", "Deno (you said 'npm is too mainstream') installed."),
+            (("bun",), 7, "🐢", "Bun.js (you're always chasing the next hotness) installed."),
+            (("ruby",), 3, "💎", "Ruby. Found everywhere, loved by some. installed."),
+            (("perl",), 2, "🔮", "Perl! It's preinstalled, but maybe you actually use it. installed."),
+            (("kotlin",), 8, "🅺", "Kotlin. You graduated from Java and feel smug about it. installed."),
+            (("scala",), 15, "⚡", "Scala. You work at a bank or a startup that thinks it's a bank. installed."),
+            (("swift",), 8, "🍎", "Swift. You have $99/year opinions. installed."),
+            (("rustc",), 15, "🦀", "Rust compiler! Memory safety AND superiority complex. installed."),
+            (("go",), 10, "🐹", "Go. You value simplicity over expressiveness. installed."),
+            (("elixir",), 18, "💧", "Elixir! Pattern matching and 'fault tolerant' everything. installed."),
+            (("erlang",), 22, "📡", "Erlang! You were doing distributed computing before it was cool. installed."),
+            (("clojure",), 20, "🧠", "Clojure! Lisp in the JVM. Peak smug. installed."),
+            (("ocaml",), 22, "🐪", "OCaml! You either do formal verification or competitive programming. installed."),
+            (("zig",), 25, "⚡", "Zig! You read the Zig docs for fun. On weekends. installed."),
+            (("lua",), 10, "🌙", "Lua! Neovim plugin dev or game scripting. Respected. installed."),
+            (("r",), 10, "📊", "R. You either do data science or biostatistics. Crying either way. installed."),
+            (("julia",), 18, "📐", "Julia! Fast and beautiful. Nobody around you knows it exists. installed."),
+            (("nim",), 25, "👁️", "Nim! 12 people use this and you're one of them. Elite club. installed."),
+            (("crystal",), 22, "💎", "Crystal! Ruby vibes, C performance. Niche and proud. installed."),
+            (("dart",), 8, "🎯", "Dart. Flutter dev or Google employee. installed."),
+            (("groovy",), 8, "🎸", "Groovy. Jenkins pipeline victim. installed."),
+            (("tcl",), 18, "🐍", "Tcl! You are from a different timeline entirely. installed."),
+            (("sbcl",), 28, "λ", "Common Lisp (SBCL)! Parentheses all the way down. installed."),
+            (("racket",), 20, "🎾", "Racket! You took a PL theory class and never recovered. installed."),
+            (("fortran",), 30, "🦕", "Fortran! You are either 80 years old or doing numerical computing. installed."),
+            (("cobol",), 35, "🏦", "COBOL! Banks pay you more than God. installed."),
+            (("ada",), 30, "✈️", "Ada! Aviation? Defense? You care if planes stay in the sky. installed."),
+            (("fpc",), 22, "🎠", "Pascal/FPC! Legendary. Nostalgic. Chaotic. installed."),
+        ], langs)
         self.profile["languages"] = langs
 
     def check_git(self):
@@ -573,19 +737,17 @@ class DevScanner:
             ("xxd",          3,  "🔢", "xxd! Hex dump tool. You speak bytes."),
         ]
         
-        for cmd, pts, emoji, msg in tools:
-            if cmd_exists(cmd):
-                self.award(pts, emoji, msg)
+        self.apply_rules([((cmd,), pts, emoji, msg) for cmd, pts, emoji, msg in tools])
                 
         # Exclusive checks to prevent double-point bloat
-        if cmd_exists("eza"):
+        if self.has("eza"):
             self.award(8, "📁", "eza! ls replacement. Color, icons, git status. Maximum customization.")
-        elif cmd_exists("exa"):
+        elif self.has("exa"):
             self.award(6, "📁", "exa (old eza)! You care about ls output. Respectable.")
 
-        if cmd_exists("curl"):
+        if self.has("curl"):
             self.award(2, "🌐", "curl. The original API tester.")
-        if cmd_exists("wget"):
+        if self.has("wget"):
             self.award(2, "📥", "wget. You download files like a person of culture.")
 
     def check_shell_customization(self):
@@ -601,6 +763,7 @@ class DevScanner:
             all_content += content
             total_lines += len(content.splitlines())
             total_aliases += content.count("alias ")
+            total_aliases += len(re.findall(r"(?im)^\s*(?:Set|New)-Alias\b", content))
             total_functions += len(re.findall(r"^function\s+\w+|^\w+\s*\(\s*\)\s*\{", content, re.MULTILINE))
 
         if total_aliases > 50:
@@ -646,6 +809,9 @@ class DevScanner:
 
     def check_dotfiles(self):
         """The dotfiles: the developer's soul made visible."""
+        if is_windows():
+            return
+
         dotfile_dirs = [
             HOME / ".dotfiles",
             HOME / "dotfiles",
@@ -703,26 +869,27 @@ class DevScanner:
 
     def check_tiling_wm_and_desktop(self):
         """Window managers: the final form of procrastination."""
-        wm_checks = [
-            ("i3",       25, "🪟", "i3wm! Tiling window manager. You tile everything. Even your thoughts."),
-            ("sway",     28, "🌊", "Sway! i3 for Wayland. You're on the bleeding edge. It occasionally cuts."),
-            ("hyprland", 30, "💫", "Hyprland! Wayland compositor. Your animations are smoother than your social skills."),
-            ("bspwm",    25, "🌳", "bspwm! Binary space partitioning. You organize windows like a BST."),
-            ("dwm",      35, "⚙️",  "dwm! Dynamic window manager. You compiled your WM from source. On brand."),
-            ("qtile",    22, "🐍", "Qtile! Tiling WM in Python. You configure your WM with code."),
-            ("awesome",  25, "🌟", "Awesome WM! Lua-configured tiling. Dual name — ironically true."),
-            ("xmonad",   30, "λ",  "XMonad! Haskell-configured WM. You write type-safe window tiling logic."),
-            ("leftwm",   25, "🦀", "LeftWM! Rust-written tiling WM. Everything must be Rust."),
-            ("herbstluftwm", 28, "🍃", "herbstluftwm! If you can spell it, you deserve points."),
-            ("openbox",  10, "📦", "Openbox! Minimal floating WM. Lightweight and no-nonsense."),
-            ("fluxbox",  12, "📦", "Fluxbox! Retro minimal WM. You've been doing Linux since 2003."),
-        ]
-        for cmd, pts, emoji, msg in wm_checks:
-            if cmd_exists(cmd):
-                self.award(pts, emoji, msg)
+        if is_linux() or is_wsl():
+            wm_checks = [
+                ("i3",       25, "🪟", "i3wm! Tiling window manager. You tile everything. Even your thoughts."),
+                ("sway",     28, "🌊", "Sway! i3 for Wayland. You're on the bleeding edge. It occasionally cuts."),
+                ("hyprland", 30, "💫", "Hyprland! Wayland compositor. Your animations are smoother than your social skills."),
+                ("bspwm",    25, "🌳", "bspwm! Binary space partitioning. You organize windows like a BST."),
+                ("dwm",      35, "⚙️",  "dwm! Dynamic window manager. You compiled your WM from source. On brand."),
+                ("qtile",    22, "🐍", "Qtile! Tiling WM in Python. You configure your WM with code."),
+                ("awesome",  25, "🌟", "Awesome WM! Lua-configured tiling. Dual name — ironically true."),
+                ("xmonad",   30, "λ",  "XMonad! Haskell-configured WM. You write type-safe window tiling logic."),
+                ("leftwm",   25, "🦀", "LeftWM! Rust-written tiling WM. Everything must be Rust."),
+                ("herbstluftwm", 28, "🍃", "herbstluftwm! If you can spell it, you deserve points."),
+                ("openbox",  10, "📦", "Openbox! Minimal floating WM. Lightweight and no-nonsense."),
+                ("fluxbox",  12, "📦", "Fluxbox! Retro minimal WM. You've been doing Linux since 2003."),
+            ]
+            for cmd, pts, emoji, msg in wm_checks:
+                if cmd_exists(cmd):
+                    self.award(pts, emoji, msg)
 
-        if os.environ.get("WAYLAND_DISPLAY"):
-            self.award(10, "🌊", "Running Wayland! You've moved on from X11. Brave new world.")
+            if os.environ.get("WAYLAND_DISPLAY"):
+                self.award(10, "🌊", "Running Wayland! You've moved on from X11. Brave new world.")
 
         for term, pts, emoji, msg in [
             ("kitty",    12, "🐱", "Kitty terminal! GPU-accelerated. Your terminal renders faster than most webpages."),
@@ -805,56 +972,42 @@ class DevScanner:
                     self.award(4, "📜",  f"{n} scripts in {d.name}/.")
 
         crontab = run("crontab -l 2>/dev/null")
-        if crontab and "#" not in crontab[:5]:
+        if (is_linux() or is_wsl()) and crontab and "#" not in crontab[:5]:
             job_count = len([l for l in crontab.splitlines() if l.strip() and not l.startswith("#")])
             if job_count > 0:
                 self.award(12, "⏰", f"{job_count} cron job(s)! Your computer does things while you sleep. Possibly mine crypto.")
 
-        if SYSTEM == "Linux":
+        if is_linux() or is_wsl():
             systemd_user = HOME / ".config" / "systemd" / "user"
             if systemd_user.is_dir():
                 services = list(systemd_user.glob("*.service"))
                 if services:
                     self.award(18, "⚙️", f"{len(services)} systemd user service(s). You write services for your personal projects. Unhinged. Respect.")
 
-        make_count = 0
-        try:
-            res = run(f'find "{HOME}" -maxdepth 5 -name "Makefile" -o -name "justfile" -o -name "Justfile" 2>/dev/null', timeout=10)
-            make_count = len([l for l in res.split("\n") if l.strip()])
-        except Exception:
-            pass
+        project_counts = scan_project_markers(max_depth=5, time_budget=1.5)
+        make_count = project_counts["makefile"] + project_counts["justfile"]
         if make_count > 10:
             self.award(10, "⚙️", f"{make_count} Makefiles/Justfiles. You automate your automation.")
         elif make_count > 3:
             self.award(5, "⚙️",  f"{make_count} Makefiles/Justfiles.")
 
-        rust_projects = []
-        try:
-            res = run(f'find "{HOME}" -maxdepth 5 -name "Cargo.toml" 2>/dev/null', timeout=10)
-            rust_projects = [l for l in res.split("\n") if l.strip()]
-        except Exception:
-            pass
-        if len(rust_projects) > 5:
-            self.award(15, "🦀", f"{len(rust_projects)} Rust projects. You believe in memory safety and you're not shy about it.")
-        elif len(rust_projects) > 0:
-            self.award(8, "🦀",  f"{len(rust_projects)} Rust project(s). The journey begins.")
+        rust_projects = project_counts["cargo_toml"]
+        if rust_projects > 5:
+            self.award(15, "🦀", f"{rust_projects} Rust projects. You believe in memory safety and you're not shy about it.")
+        elif rust_projects > 0:
+            self.award(8, "🦀",  f"{rust_projects} Rust project(s). The journey begins.")
 
-        nix_files = []
-        try:
-            res = run(f'find "{HOME}" -maxdepth 5 -name "*.nix" 2>/dev/null', timeout=8)
-            nix_files = [l for l in res.split("\n") if l.strip()]
-        except Exception:
-            pass
-        if len(nix_files) > 10:
-            self.award(20, "❄️", f"{len(nix_files)} Nix expression files! Your system is reproducible. Unlike your sleep schedule.")
-        elif len(nix_files) > 0:
-            self.award(10, "❄️", f"{len(nix_files)} Nix file(s). You're on the path to purity.")
+        nix_files = project_counts["nix"]
+        if nix_files > 10:
+            self.award(20, "❄️", f"{nix_files} Nix expression files! Your system is reproducible. Unlike your sleep schedule.")
+        elif nix_files > 0:
+            self.award(10, "❄️", f"{nix_files} Nix file(s). You're on the path to purity.")
 
     # ── TIER 5: LEGENDARY — Elite signals ────────────────────────────────
 
     def check_compilers_and_low_level(self):
         """The deep lore. The C programmers. The kernel hackers."""
-        for cmd, pts, emoji, msg in [
+        self.apply_rules([
             ("gcc",     3,  "⚙️",  "GCC installed. You compile C. Respect."),
             ("clang",   5,  "⚙️",  "Clang! LLVM-based. You care about error messages."),
             ("llc",     15, "⚙️",  "llc! LLVM compiler backend. You work with IR. Not human."),
@@ -871,12 +1024,10 @@ class DevScanner:
             ("ocamlfind",20,"🐪", "OCamlfind! OCaml package finder. Functional and formal."),
             ("ghc",     28, "λ",  "GHC! Haskell compiler. You think in monads. Casually."),
             ("idris2",  25, "🔮", "Idris 2! Dependently typed. Your types are theorems. You are insane (genius)."),
-        ]:
-            if cmd_exists(cmd):
-                self.award(pts, emoji, msg)
+        ])
 
-        if SYSTEM == "Linux":
-            if cmd_exists("dkms"):
+        if is_linux() or is_wsl():
+            if self.has("dkms"):
                 self.award(15, "⚙️", "DKMS! Dynamic Kernel Module Support. You manage out-of-tree kernel modules.")
             modules_dir = Path("/lib/modules")
             if modules_dir.is_dir():
@@ -886,19 +1037,19 @@ class DevScanner:
                     self.warn("Multiple kernel versions found. You've been 'just in case' boot-loop-proofing since 2018.")
 
         cross_tools = ["arm-linux-gnueabi-gcc", "aarch64-linux-gnu-gcc", "mips-linux-gnu-gcc", "riscv64-linux-gnu-gcc"]
-        cross_found = [t for t in cross_tools if cmd_exists(t)]
+        cross_found = [t for t in cross_tools if self.has(t)]
         if cross_found:
             self.award(30, "🔩", f"Cross-compiler(s) found: {', '.join(cross_found)}! You compile for architectures your laptop can't run. Based.")
 
-        if cmd_exists("avr-gcc") or cmd_exists("avrdude"):
+        if self.has("avr-gcc", "avrdude"):
             self.award(25, "🤖", "AVR toolchain! You program microcontrollers. Byte-level everything.")
-        if cmd_exists("arm-none-eabi-gcc"):
+        if self.has("arm-none-eabi-gcc"):
             self.award(25, "🤖", "ARM bare-metal toolchain! Embedded systems. You write code that runs on PCBs.")
-        if cmd_exists("pio"):
+        if self.has("pio"):
             self.award(15, "🤖", "PlatformIO! Embedded dev. Arduino grown up.")
-        if cmd_exists("qemu") or cmd_exists("qemu-system-x86_64"):
+        if self.has("qemu", "qemu-system-x86_64"):
             self.award(20, "🖥️",  "QEMU! Virtual machines from the terminal. You run operating systems as a hobby.")
-        if cmd_exists("bochs"):
+        if self.has("bochs"):
             self.award(30, "🖥️",  "Bochs! x86 emulator. You debug OS kernels and boot sectors.")
 
     def check_security_tools(self):
@@ -922,18 +1073,16 @@ class DevScanner:
             ("yara",         20, "🦟", "YARA! Malware pattern matching. Malware analyst or researcher."),
             ("volatility",   15, "🧠", "Volatility! Memory forensics framework. You examine RAM dumps."),
         ]
-        for cmd, pts, emoji, msg in sec_tools:
-            if cmd_exists(cmd):
-                self.award(pts, emoji, msg)
+        self.apply_rules([((cmd,), pts, emoji, msg) for cmd, pts, emoji, msg in sec_tools])
 
         # Handle MSF without double-counting
-        if cmd_exists("msfconsole"):
+        if self.has("msfconsole"):
             self.award(15, "💀", "msfconsole! Metasploit console. Pentest credentials confirmed.")
-        elif cmd_exists("metasploit-framework"):
+        elif self.has("metasploit-framework"):
             self.award(15, "💀", "Metasploit! You find exploits or you find exploits. Red team detected.")
 
         sshd_config = "/etc/ssh/sshd_config"
-        if file_exists(sshd_config):
+        if (is_linux() or is_wsl()) and file_exists(sshd_config):
             content = read_file_safe(sshd_config)
             if "PermitRootLogin no" in content:
                 self.award(10, "🔒", "SSH configured to deny root login. Basic sysadmin hygiene. Appreciated.")
@@ -954,23 +1103,21 @@ class DevScanner:
             ("wandb",      12, "🔮", "Weights & Biases! You log experiments to the cloud and watch graphs."),
             ("dvc",        12, "📦", "DVC! Data version control. git for data. You're serious about ML."),
         ]
-        for cmd, pts, emoji, msg in ml_tools:
-            if cmd_exists(cmd):
-                self.award(pts, emoji, msg)
+        self.apply_rules([((cmd,), pts, emoji, msg) for cmd, pts, emoji, msg in ml_tools])
 
-        if cmd_exists("nvcc"):
+        if self.has("nvcc"):
             self.award(20, "⚡", "NVCC! CUDA compiler! You write GPU kernels. Your code runs on silicon at scale.")
-        if cmd_exists("rocminfo") or cmd_exists("clinfo"):
+        if self.has("rocminfo", "clinfo"):
             self.award(15, "⚡", "GPU compute tools (ROCm/OpenCL) installed. Heterogeneous computing enjoyer.")
 
-        if cmd_exists("huggingface-cli"):
+        if self.has("huggingface-cli"):
             self.award(10, "🤗", "Hugging Face CLI! You download models like normal people download songs.")
 
     # ── TIER 6: MYTHICAL ─────────────────────────────────────────────────
 
     def check_legendary_stuff(self):
         """Signs of transcendence."""
-        if SYSTEM == "Linux":
+        if is_linux() or is_wsl():
             kernel_conf = run("ls /boot/config-* 2>/dev/null")
             if kernel_conf:
                 proc_config = run("zcat /proc/config.gz 2>/dev/null | wc -l")
@@ -980,31 +1127,27 @@ class DevScanner:
                 except Exception:
                     pass
 
-        for latex_cmd, pts, emoji, msg in [
+        self.apply_rules([
             ("latex",    15, "📄", "LaTeX installed! You typeset mathematics and hate Word users."),
             ("pdflatex", 15, "📄", "pdflatex! You write papers in LaTeX and compile them manually."),
             ("xelatex",  18, "📄", "XeLaTeX! Unicode and custom fonts in LaTeX. Typesetting perfectionist."),
             ("lualatex", 18, "📄", "LuaLaTeX! LaTeX with Lua scripting. Over-engineer even your documents."),
             ("bibtex",   12, "📚", "BibTeX! You manage references in plaintext files. Academic detected."),
-        ]:
-            if cmd_exists(latex_cmd):
-                self.award(pts, emoji, msg)
+        ])
 
         lex_tools = ["flex", "bison", "antlr4", "yacc"]
-        found_lex = [t for t in lex_tools if cmd_exists(t)]
+        found_lex = [t for t in lex_tools if self.has(t)]
         if found_lex:
             self.award(30, "🔮", f"Lexer/parser tools found: {', '.join(found_lex)}! You write compilers for fun. Or class. Either way, you suffer beautifully.")
 
-        for tool, pts, emoji, msg in [
+        self.apply_rules([
             ("lean",     45, "🧮", "Lean theorem prover! You write mathematical proofs as programs. You are beyond programming."),
             ("coq",      45, "🧮", "Coq proof assistant! 'My code doesn't have bugs' — proven by type theory."),
             ("agda",     45, "🧮", "Agda! Dependent types as a lifestyle. You are not a software engineer. You are a mathematician."),
             ("isabelle", 45, "🧮", "Isabelle! Interactive theorem prover. Your hobby is formally verifying software."),
-        ]:
-            if cmd_exists(tool):
-                self.award(pts, emoji, msg)
+        ])
 
-        for tool, pts, emoji, msg in [
+        self.apply_rules([
             ("tcc",      20, "⚡", "TinyCC! Minimal C compiler. You like your tools small and fast."),
             ("musl-gcc", 25, "⚙️",  "musl-libc gcc! Minimal C library. You link against musl for purity."),
             ("plan9port", 40, "🔮", "Plan 9 from Bell Labs tools! You are a UNIX philosopher and archaeologist."),
@@ -1017,23 +1160,555 @@ class DevScanner:
             ("k",        38, "📊", "K language! Financial array programming. 3 characters, 40 operations."),
             ("q",        35, "💹", "Q/KDB+! Financial databases. You work in finance or academic research."),
             ("forth",    35, "🔩", "Forth! Stack-based language. Compact. Powerful. For embedded and minimalists."),
-        ]:
-            if cmd_exists(tool):
-                self.award(pts, emoji, msg)
+        ])
 
         for irc_tool in ["weechat", "irssi", "hexchat", "catgirl"]:
-            if cmd_exists(irc_tool):
+            if self.has(irc_tool):
                 self.award(15, "📡", f"{irc_tool}! IRC client. You use chat protocols from 1988. Timeless.")
                 break
 
         if file_exists(HOME / "flake.nix") or file_exists(HOME / ".config" / "home-manager" / "flake.nix"):
             self.award(35, "❄️", "Nix Flake in home/config! Your entire system is reproducible and your friends don't understand why.")
 
-        if cmd_exists("home-manager"):
+        if self.has("home-manager"):
             self.award(30, "❄️", "home-manager! You manage your user environment with Nix. Fully declarative. Fully committed.")
 
-        if cmd_exists("guix"):
+        if self.has("guix"):
             self.award(40, "🐃", "GNU Guix! Purely functional package manager. You follow Richard Stallman's path but make it Haskell-adjacent.")
+
+    # ── EXTENDED CHECKS — Modern stack signals ────────────────────────────
+
+    def check_databases(self):
+        """Databases on disk are a confident signal of a real backend developer."""
+        confirmed: List[str] = []
+        rules = [
+            (("psql", "postgres"),    14, "🐘", "PostgreSQL client. The database for people who care about correctness."),
+            (("mysql",),               6, "🐬", "MySQL client. Pragmatic, scarred, employed."),
+            (("mariadb",),             8, "🦭", "MariaDB. You picked the fork. You read licensing news."),
+            (("sqlite3",),             6, "📄", "sqlite3. The most-deployed database on Earth lives on your disk."),
+            (("redis-cli",),          10, "🟥", "redis-cli. Cache, queue, lock, leaderboard. Swiss-army key/value store."),
+            (("mongosh", "mongo"),     6, "🍃", "MongoDB shell. Documents schemas at runtime. We forgive you."),
+            (("duckdb",),             18, "🦆", "DuckDB. Analytical SQL on a laptop. Peak modern data engineering taste."),
+            (("clickhouse-client",),  18, "📊", "ClickHouse. Columnar OLAP at terrifying speed. You eat petabytes for breakfast."),
+            (("cockroach",),          20, "🪳", "CockroachDB. Distributed SQL. Resilient like its namesake."),
+            (("surreal",),            18, "🌀", "SurrealDB. Multi-model. You read product launches the day they ship."),
+            (("influx",),             10, "📈", "InfluxDB. Time-series specialist. You graph everything, including your sleep."),
+            (("etcdctl",),            14, "🗝️",  "etcdctl. Distributed consensus storage. Kubernetes-adjacent power user."),
+            (("cqlsh",),              16, "🌌", "Cassandra (cqlsh). Wide-column, eventual-consistency lifestyle."),
+            (("scylla",),             18, "🐉", "ScyllaDB. C++ Cassandra. You measure latency in microseconds."),
+            (("neo4j",),              16, "🕸️",  "Neo4j. Graphs everywhere. Your data model has edges and feelings."),
+            (("dgraph",),             18, "🕸️",  "Dgraph. Distributed graph DB. You picked the niche fork of niche."),
+            (("rqlite",),             18, "🪨", "rqlite. Distributed SQLite. You like contradictions."),
+            (("timescaledb-tune",),   16, "⏳", "TimescaleDB tuner. Postgres for time-series. Refined taste."),
+            (("pgcli",),              10, "🐘", "pgcli. Autocompleting Postgres shell. You don't tolerate raw psql."),
+            (("mycli",),               6, "🐬", "mycli. Autocompleting MySQL shell. Civilised."),
+            (("litecli",),             8, "📄", "litecli. Autocompleting SQLite shell. You polish even the small things."),
+            (("usql",),               14, "🔌", "usql. Universal SQL CLI. You speak every dialect."),
+        ]
+        self.apply_rules(rules, confirmed)
+        self.profile["databases"] = confirmed
+
+    def check_web_servers_and_proxies(self):
+        """Reverse proxies, load balancers, real-deal HTTP daemons."""
+        servers: List[str] = []
+        rules = [
+            (("nginx",),     8,  "🌐", "nginx. The reverse proxy of the modern web."),
+            (("apache2", "httpd"), 4, "🪶", "Apache. Battle-tested, .htaccess-cursed, still serving."),
+            (("caddy",),    14, "🍬", "Caddy. Automatic HTTPS by default. You demand sane defaults."),
+            (("lighttpd",), 12, "🪶", "lighttpd. Embedded-grade web server. Minimalist."),
+            (("traefik",),  14, "🚦", "Traefik. Service-discovery reverse proxy. Container-native router."),
+            (("envoy",),    18, "✉️",  "Envoy. The proxy that runs the modern service mesh."),
+            (("haproxy",),  12, "🧭", "HAProxy. Layer-4/7 load balancing without compromise."),
+            (("varnish", "varnishd"), 14, "🪞", "Varnish. HTTP caching at scale. You speak VCL."),
+            (("consul",),   14, "🗺️",  "HashiCorp Consul. Service discovery and KV. Networking nerd."),
+            (("nomad",),    16, "🪖", "Nomad. Workload orchestration without Kubernetes ceremony."),
+            (("vault",),    16, "🏦", "HashiCorp Vault. Secrets-as-a-service. You take leakage seriously."),
+            (("nats", "nats-server"), 14, "📨", "NATS. Tiny, fast pub/sub messaging. Distributed-systems builder."),
+            (("step",),     12, "🪪", "step CLI. Internal PKI. You issue your own certificates."),
+            (("mkcert",),    8, "🔏", "mkcert. Local trusted dev certs. No more SSL warnings in dev."),
+        ]
+        self.apply_rules(rules, servers)
+        self.profile["web_servers"] = servers
+
+    def check_observability(self):
+        """Metrics, traces, logs — the holy trinity of production maturity."""
+        signals: List[str] = []
+        rules = [
+            (("prometheus",),         14, "🔥", "Prometheus. Pull-based metrics. Production-grade observability."),
+            (("promtool",),           10, "🔥", "promtool. You lint your alerting rules."),
+            (("grafana-server",),     12, "📊", "Grafana server installed. Your dashboards have dashboards."),
+            (("loki",),               14, "🪵", "Loki. Log aggregation, Prometheus-style. Modern logging stack."),
+            (("tempo",),              14, "⏱️",  "Tempo. Distributed tracing storage. Span-curious."),
+            (("jaeger",),             14, "🔭", "Jaeger. Distributed tracing. You've debugged across services."),
+            (("otelcol", "otelcol-contrib"), 16, "🛰️",  "OpenTelemetry Collector. Vendor-neutral telemetry pipeline."),
+            (("vector",),             16, "🌊", "Vector. High-performance log/metric pipeline in Rust."),
+            (("fluent-bit", "fluentd"), 12, "🪡", "Fluent forwarder. Log shipping, properly."),
+            (("datadog-agent",),      10, "🐶", "Datadog Agent. Your billing department weeps. Quietly."),
+            (("newrelic-cli",),        8, "🆕", "New Relic CLI. APM enthusiast."),
+            (("sentry-cli",),         10, "🛡️",  "Sentry CLI. You ship release tracking with your deploys."),
+            (("uptime",),              4, "⏲️",  "uptime. System monitoring basic literacy."),
+        ]
+        self.apply_rules(rules, signals)
+        self.profile["observability"] = signals
+
+    def check_testing_and_quality(self):
+        """Test runners, fuzzers, linters — the difference between code and software."""
+        tests: List[str] = []
+        rules = [
+            (("pytest",),         8,  "🧪", "pytest. The Python test runner of taste."),
+            (("tox",),            8,  "📦", "tox. Multi-env Python testing. You test the matrix."),
+            (("nox",),            8,  "🦊", "nox. tox in Python. You picked the modern fork."),
+            (("hypothesis",),    14,  "🎲", "hypothesis. Property-based testing in Python. You think in invariants."),
+            (("jest",),           6,  "🃏", "jest. JS testing default. Reliable."),
+            (("vitest",),         8,  "⚡", "vitest. Vite-era test runner. You like fast feedback loops."),
+            (("mocha",),          6,  "☕", "mocha. Classic JS test runner. Old guard."),
+            (("playwright",),    14,  "🎭", "Playwright. End-to-end browser testing. You actually test the UI."),
+            (("cypress",),       12,  "🌲", "Cypress. Browser test runner. You ship E2E with confidence."),
+            (("selenium-side-runner",), 8, "🧭", "Selenium. Veteran browser automation."),
+            (("k6",),            14,  "🏋️",  "k6. Load testing in JavaScript. You break things deliberately."),
+            (("locust",),        12,  "🦗", "Locust. Load testing in Python. Performance-curious."),
+            (("ab",),             4,  "📈", "ab (ApacheBench). Simple, brutal, effective."),
+            (("wrk",),           10,  "💪", "wrk. Modern HTTP benchmarking. You measure tail latency."),
+            (("siege",),          8,  "🏰", "siege. HTTP load testing classic."),
+            (("afl-fuzz", "afl-clang"), 22, "🧬", "AFL fuzzer. You feed random bytes to programs and watch them die."),
+            (("honggfuzz",),     22,  "🧬", "honggfuzz. Coverage-guided fuzzing. Memory-safety crusader."),
+            (("libfuzzer",),     20,  "🧬", "libfuzzer. In-process fuzzing. Defensive-programming maximalist."),
+            # Linters / formatters
+            (("ruff",),          10,  "🦊", "ruff. The Python linter that broke the speed sound barrier."),
+            (("black",),          5,  "⚫", "black. Opinionated Python formatter. You stopped arguing about commas."),
+            (("isort",),          4,  "🔤", "isort. Sorted imports. Order matters."),
+            (("mypy",),          10,  "🔠", "mypy. Static types in Python. You disagree with duck typing."),
+            (("pyright",),       12,  "🔠", "pyright. Microsoft's faster mypy. You picked correctness over consensus."),
+            (("eslint",),         5,  "🛡️",  "ESLint. The JS linter you can't escape."),
+            (("biome",),         12,  "🌿", "Biome. Rust-powered JS toolchain. You said goodbye to ESLint+Prettier."),
+            (("prettier",),       4,  "💅", "Prettier. Auto-formatted JS. The arguments stopped years ago."),
+            (("clippy-driver",), 10,  "📎", "clippy. Rust's brutal linter. You take its advice."),
+            (("golangci-lint",), 12,  "🐹", "golangci-lint. The Go meta-linter. Idiomatic Go enforcer."),
+            (("rubocop",),        6,  "🚓", "RuboCop. Ruby style police. Officer present."),
+            (("hlint",),         12,  "λ", "hlint. Haskell linter. You refactor pointful into pointfree on sight."),
+            (("shellcheck",),    10,  "🐚", "ShellCheck. Static analysis for shell scripts. Bash bug hunter."),
+            (("shfmt",),          6,  "🐚", "shfmt. Formatted shell. Even your scripts have taste."),
+            (("semgrep",),       14,  "🔬", "Semgrep. Pattern-based static analysis. AppSec literate."),
+            (("codeql",),        16,  "🔍", "CodeQL. GitHub's query engine. You write queries about codebases."),
+            (("sonar-scanner",), 10,  "📡", "SonarQube scanner. Enterprise quality gate operator."),
+            (("scc", "cloc"),     6,  "📏", "Code line counter (scc/cloc). You quantify your output."),
+            (("tokei",),          0,  "",   ""),  # Already counted in terminal tools.
+        ]
+        # Filter out empty placeholder rules
+        self.apply_rules([r for r in rules if r[2]], tests)
+        self.profile["testing"] = tests
+
+    def check_documentation_tools(self):
+        """Documentation engines — the mark of someone who actually ships."""
+        rules = [
+            (("pandoc",),       12, "📝", "pandoc. Universal document converter. You weaponize markdown."),
+            (("typst",),        18, "📐", "Typst. The modern LaTeX. You read HN the day it landed."),
+            (("asciidoctor",),  12, "📜", "AsciiDoctor. You picked AsciiDoc over Markdown. Refined choice."),
+            (("sphinx-build",), 12, "🦁", "Sphinx. Python docs at industrial scale. You document properly."),
+            (("mkdocs",),        8, "📖", "MkDocs. Python-flavored static docs. Sensible default."),
+            (("hugo",),         10, "⚡", "Hugo. Go static site generator. Sub-second builds."),
+            (("zola",),         12, "🦀", "Zola. Rust static site generator. Single-binary purity."),
+            (("jekyll",),        6, "💎", "Jekyll. The OG static site engine. GitHub Pages compatible."),
+            (("eleventy", "@11ty/eleventy"), 10, "🟢", "Eleventy. Zero-config JS static site gen. You like quiet tools."),
+            (("docusaurus",),   10, "🦖", "Docusaurus. React documentation. You document like Meta."),
+            (("mdbook",),       12, "📕", "mdbook. Rust-style book generator. The Rust Book vibes."),
+            (("vitepress", "vuepress"), 8, "🟩", "VitePress/VuePress. Vue-flavored docs."),
+            (("tldr",),          0, "",   ""),  # Already counted.
+        ]
+        self.apply_rules([r for r in rules if r[2]])
+
+    def check_alternative_vcs(self):
+        """Anyone using non-Git VCS in 2026 is making a deliberate, expert choice."""
+        if cmd_exists("hg"):
+            self.award(20, "💧", "Mercurial (hg). You use the VCS Facebook and Mozilla actually deploy.")
+        if cmd_exists("fossil"):
+            self.award(28, "🦴", "Fossil. Single-file VCS with built-in wiki and bug tracker. SQLite-author taste.")
+        if cmd_exists("jj"):
+            self.award(30, "🪼", "Jujutsu (jj). The next-gen Git frontend. You read changelogs of changelogs.")
+        if cmd_exists("pijul"):
+            self.award(32, "🌲", "Pijul. Patch-theory VCS. You read papers about version control.")
+        if cmd_exists("darcs"):
+            self.award(28, "🎯", "darcs. Patch-based VCS. You've been doing this since before git existed.")
+        if cmd_exists("bzr") or cmd_exists("brz"):
+            self.award(15, "🐝", "Bazaar/Breezy. You maintain Ubuntu packages or remember Launchpad fondly.")
+        if cmd_exists("svn"):
+            self.award(4, "🗄️",  "Subversion. Real software still uses this. You probably maintain some.")
+        if cmd_exists("cvs"):
+            self.award(20, "🪦", "CVS. You time-traveled here from 1999. We have questions.")
+
+    def check_more_languages(self):
+        """The long tail of languages — niche, modern, esoteric, or all three."""
+        confirmed: List[str] = []
+        rules = [
+            (("ghc", "ghcup"),    0, "",   ""),  # Already counted.
+            (("cabal", "stack"), 14, "🐫", "Haskell build tool (cabal/stack). You ship Haskell, not just admire it."),
+            (("purs",),          22, "💜", "PureScript. Strongly-typed JS. You believe in type safety on the frontend."),
+            (("rescript",),      18, "🎨", "ReScript. OCaml on JS. You miss F#."),
+            (("gleam",),         24, "✨", "Gleam. Typed BEAM language. You read every issue of the Gleam newsletter."),
+            (("roc",),           28, "🦜", "Roc. Pure functional, fast. You back niche compilers on GitHub Sponsors."),
+            (("grain",),         24, "🌾", "Grain. WebAssembly-first ML-family language. Bleeding edge."),
+            (("hare",),          28, "🐇", "Hare. Drew DeVault's systems language. You hand-roll philosophy."),
+            (("odin",),          22, "🪶", "Odin. C alternative for game/system devs. Aesthetic and pragmatic."),
+            (("v",),             18, "📐", "V. Promised everything, delivered some of it. You watch the journey."),
+            (("zls",),           14, "⚡", "Zig language server. You actively develop in Zig, not just dabble."),
+            (("mojo",),          22, "🔥", "Mojo. Modular's Python-superset for AI. You bet on the future."),
+            (("raku",),          22, "🦋", "Raku (Perl 6). Sigils, grammars, junctions. Beautiful. Niche."),
+            (("io",),            26, "🌀", "Io language. Prototype-based. You read 'Seven Languages in Seven Weeks' and committed."),
+            (("janet",),         24, "🌿", "Janet. Embeddable Lisp dialect. You write tools for yourself."),
+            (("wren",),          22, "🐦", "Wren. Tiny scripting language. Game-engine adjacent."),
+            (("hy",),            18, "🐍", "Hy. Lisp on Python's runtime. Why pick one paradigm?"),
+            (("pony",),          24, "🐴", "Pony. Capabilities-secure actor language. You read research papers for fun."),
+            (("nelua",),         24, "🌙", "Nelua. Statically-typed Lua. Niche of niche."),
+            (("crystal",),        0, "",   ""),  # Already counted.
+            (("smalltalk", "gst"), 26, "🟦", "GNU Smalltalk. Object-orientation, the original. You know what 'image-based' means."),
+            (("swipl",),         22, "🔮", "SWI-Prolog. Declarative logic programming. Your code unifies."),
+            (("scheme", "guile", "chicken", "racket"), 0, "", ""),  # racket counted.
+            (("io",),             0, "",   ""),  # dup
+            (("dhall",),         22, "🪶", "Dhall. Total functional config language. JSON without footguns."),
+            (("cue",),           18, "🟦", "CUE. Constraints-based configuration. You hate YAML and have proof."),
+            (("nickel",),        20, "🪙", "Nickel. Functional config language. Nix-adjacent."),
+        ]
+        self.apply_rules([r for r in rules if r[2]], confirmed)
+        if confirmed:
+            self.profile.setdefault("languages", []).extend(confirmed)
+
+    def check_messaging_and_streaming(self):
+        """Brokers and queues — backbone of the modern distributed system."""
+        rules = [
+            (("kafka-topics", "kafka-console-producer"), 18, "🌊", "Kafka tools. Event-streaming at scale. Distributed-log adept."),
+            (("rabbitmqctl", "rabbitmq-server"),         14, "🐰", "RabbitMQ. AMQP. The reliable veteran of message brokers."),
+            (("mosquitto",),                             12, "📡", "Mosquitto. MQTT broker. IoT or home-automation builder."),
+            (("nsqd",),                                  14, "📬", "NSQ. Distributed messaging. You read engineering blogs from 2014."),
+            (("pulsar-admin",),                          18, "🌌", "Apache Pulsar. Multi-tenant streaming. You compared it to Kafka and chose this."),
+            (("redpanda",),                              18, "🐼", "Redpanda. Kafka-compatible C++ broker. Latency obsessive."),
+        ]
+        self.apply_rules(rules)
+
+    def check_mobile_and_game_dev(self):
+        """Mobile + game dev — verifiable, confident signals."""
+        if is_macos() and (Path("/Applications/Xcode.app").exists() or cmd_exists("xcodebuild")):
+            self.award(10, "📱", "Xcode toolchain. iOS/macOS native development confirmed.")
+        if cmd_exists("xcrun"):
+            self.award(4, "🍏", "xcrun present. Apple developer environment configured.")
+        if cmd_exists("adb"):
+            self.award(8, "🤖", "Android Debug Bridge. You sideload, debug, and own your phone properly.")
+        if cmd_exists("fastboot"):
+            self.award(10, "🔓", "fastboot. You unlock bootloaders. Custom-ROM territory.")
+        if cmd_exists("gradle"):
+            self.award(6, "🐘", "Gradle. JVM build tool. Android or Kotlin shipper.")
+        if cmd_exists("fastlane"):
+            self.award(12, "🚄", "fastlane. Mobile release automation. You ship to App Store from CLI.")
+        if cmd_exists("expo"):
+            self.award(8, "📲", "Expo. React Native shipping made bearable.")
+        if cmd_exists("flutter"):
+            self.award(10, "🦋", "Flutter. Cross-platform UI. Dart-curious mobile builder.")
+        if cmd_exists("godot") or cmd_exists("godot4"):
+            self.award(15, "🎮", "Godot engine. Open-source game development. Independent and proud.")
+        if cmd_exists("love"):
+            self.award(14, "❤️",  "LÖVE 2D. Lua game framework. Game-jam veteran energy.")
+        if cmd_exists("raylib") or cmd_exists("rlpkg"):
+            self.award(15, "🎮", "raylib. Tiny C game library. From-scratch game programmer.")
+        if cmd_exists("sdl2-config") or cmd_exists("sdl-config"):
+            self.award(8, "🎯", "SDL development files. You build games or emulators in C/C++.")
+        if cmd_exists("blender"):
+            self.award(8, "🟧", "Blender. 3D modeling and rendering. Asset pipeline literate.")
+
+    def check_data_engineering(self):
+        """Modern data stack — the rise of analytics engineers."""
+        rules = [
+            (("dbt",),         14, "🔧", "dbt. SQL transformations done right. Analytics engineer detected."),
+            (("airflow",),     14, "💨", "Apache Airflow. DAGs for everything. Workflow orchestration veteran."),
+            (("prefect",),     14, "🪄", "Prefect. Modern Python orchestration. You picked the friendly fork."),
+            (("dagster",),     14, "✨", "Dagster. Asset-centric pipelines. Data engineering future-thinker."),
+            (("spark-shell", "pyspark"), 12, "⚡", "Apache Spark. Big-data processing. JVM ML pipelines."),
+            (("flink",),       16, "🪶", "Apache Flink. Stream processing. You think in unbounded datasets."),
+            (("trino", "presto"), 16, "🚂", "Trino/Presto. Federated SQL. You query everything from one shell."),
+            (("clickhouse-local",), 18, "📊", "clickhouse-local. Single-binary OLAP CLI. Power user."),
+            (("duckdb",),       0, "", ""),  # already counted
+            (("polars",),      14, "🐻‍❄️", "Polars CLI tools. Rust-powered dataframes. pandas pretender no longer."),
+        ]
+        self.apply_rules([r for r in rules if r[2]])
+
+    def check_advanced_networking(self):
+        """Beyond ping — power-user network tooling."""
+        rules = [
+            (("iperf3", "iperf"),  10, "📡", "iperf. Network throughput testing. You measure your LAN scientifically."),
+            (("iftop",),            8, "📊", "iftop. Live bandwidth visualization. You watch packets like TV."),
+            (("nethogs",),         10, "🐗", "nethogs. Per-process bandwidth. You hunt the noisy neighbor."),
+            (("vnstat",),           6, "📈", "vnstat. Bandwidth statistics over time. Quietly tracking everything."),
+            (("nload",),            6, "📉", "nload. Real-time network load. Sysadmin habit."),
+            (("ngrep",),           10, "🔍", "ngrep. grep on packets. You debug protocols at the byte level."),
+            (("socat",),           14, "🔗", "socat. The universal socket relay. You build network plumbing on the fly."),
+            (("ipcalc", "sipcalc"), 6, "🧮", "ipcalc. Subnet math without paper. Network engineer hygiene."),
+            (("dig",),              4, "🔎", "dig. The right way to query DNS."),
+            (("dog",),             10, "🐕", "dog. Modern dig in Rust. You prefer color and JSON."),
+            (("doggo",),           10, "🐶", "doggo. Modern dig in Go. You picked the friendly DNS client."),
+            (("whois",),            4, "📇", "whois. Domain forensics. You investigate before you trust."),
+            (("rsync",),            6, "🔄", "rsync. The safest way to move bytes between machines."),
+            (("croc",),            10, "🐊", "croc. Encrypted P2P file transfer. You moved on from scp."),
+            (("magic-wormhole",),  12, "🌀", "magic-wormhole. Codeword-based file transfer. You pick beautiful tools."),
+            (("ssh-audit",),       12, "🔐", "ssh-audit. SSH server hardening. You verify, not assume."),
+            (("nuclei",),          14, "💥", "nuclei. Template-based vulnerability scanner. AppSec engineer."),
+        ]
+        self.apply_rules(rules)
+
+    def check_privacy_and_vpn(self):
+        """Privacy stack — strong opinions about the network."""
+        rules = [
+            (("wg", "wg-quick"),       12, "🛡️",  "WireGuard. Modern VPN. You picked the right protocol."),
+            (("openvpn",),              6, "🔐", "OpenVPN. The veteran. Configurable to a fault."),
+            (("tailscale",),           14, "🪢", "Tailscale. Mesh networking that just works. Pragmatic privacy."),
+            (("headscale",),           18, "🐙", "Headscale. Self-hosted Tailscale control plane. Sovereignty maximalist."),
+            (("mullvad",),             14, "🦊", "Mullvad CLI. Privacy-first VPN. You pay in Monero for fun."),
+            (("protonvpn-cli", "protonvpn"), 12, "🛡️",  "ProtonVPN CLI. Privacy by Geneva default."),
+            (("tor", "torbrowser-launcher"), 12, "🧅", "Tor. Onion routing. You actually understand threat models."),
+            (("i2prouter",),           18, "🌐", "I2P router. Anonymity network deeper than Tor. Operator-grade privacy."),
+            (("yt-dlp",),               8, "📹", "yt-dlp. The download tool that respects your machine. yt-dlp gang."),
+            (("aria2c",),               8, "📥", "aria2c. Multi-source download accelerator. Old-school power user."),
+            (("syncthing",),           14, "🔄", "Syncthing. P2P file sync. You don't trust Dropbox."),
+            (("rclone",),              10, "☁️", "rclone. Cloud-storage power tool. You orchestrate buckets from CLI."),
+            (("restic",),              14, "🛟", "restic. Encrypted, deduplicated backups. You sleep well."),
+            (("borgbackup", "borg"),   14, "🐻", "Borg backups. Tested, reliable, paranoid. The right call."),
+        ]
+        self.apply_rules(rules)
+
+    def check_note_taking_and_productivity(self):
+        """The 'I take my second brain seriously' stack."""
+        rules = [
+            (("taskwarrior", "task"), 10, "✅", "Taskwarrior. CLI todo list with a UDA system. Productivity hacker."),
+            (("timew",),               10, "⏱️",  "Timewarrior. CLI time tracking. You measure your focus."),
+            (("zk",),                  14, "🗒️",  "zk. CLI Zettelkasten. You actually maintain your notes."),
+            (("obsidian",),             6, "🪨", "Obsidian. Local-first markdown vault. You own your notes."),
+            (("logseq",),              10, "🧱", "Logseq. Outliner-style PKM. You think in graphs."),
+            (("joplin",),               6, "📓", "Joplin. End-to-end encrypted notes. Privacy-aware notetaker."),
+            (("vimwiki",),             14, "📓", "vimwiki. Notes in vim. You never leave the editor."),
+            (("orgmode", "emacs-org"), 16, "📅", "Org mode. The PKM that runs your life. Emacs-adjacent saint."),
+            (("calcurse",),            12, "📅", "calcurse. CLI calendar. You schedule from the terminal."),
+            (("khal",),                12, "📆", "khal. CLI CalDAV calendar. Server-side power user."),
+            (("vdirsyncer",),          12, "🔄", "vdirsyncer. Contacts/calendar sync. CalDAV operator."),
+            (("pass",),                12, "🔑", "pass. The standard Unix password manager. GPG-backed and beautiful."),
+            (("gopass",),              12, "🔑", "gopass. pass in Go with extras. Team-secret literate."),
+            (("bitwarden", "bw"),       8, "🔒", "Bitwarden CLI. You manage secrets from scripts."),
+            (("rbw",),                 12, "🔒", "rbw. Unofficial Rust Bitwarden CLI. You like fast and small."),
+            (("age",),                 14, "🔐", "age. Modern file encryption. The right replacement for GPG-for-files."),
+            (("rage",),                14, "🦀", "rage. age in Rust. You collect Rust ports of Go tools."),
+        ]
+        self.apply_rules(rules)
+
+    def check_browsers_and_web_stack(self):
+        """Browser choice and modern web tooling."""
+        rules = [
+            (("qutebrowser",), 16, "🦖", "qutebrowser. Vim-keybindings browser. You browse with hjkl."),
+            (("nyxt",),        20, "🦊", "Nyxt. Lisp-extensible browser. Power-user territory."),
+            (("lynx",),        12, "📜", "Lynx. Text-mode browser. You read the web like Plato did."),
+            (("w3m",),         12, "📜", "w3m. Text browser with images. You read HN inside Emacs."),
+            (("browsh",),      14, "🌐", "browsh. Real browser, terminal-rendered. You break conventions."),
+            (("chromium",),     2, "🌍", "Chromium. The honest version of Chrome."),
+            (("firefox-developer-edition",), 8, "🦊", "Firefox Developer Edition. Web platform engineer signal."),
+            # Modern web build tools — only counted here, not in package managers.
+            (("vite",),         8, "⚡", "Vite. Modern dev server. You moved on from webpack and you're happy."),
+            (("esbuild",),      8, "🥇", "esbuild. Go-powered bundling at the speed of thought."),
+            (("swc",),         10, "🦀", "swc. Rust-powered JS toolchain. You measure build times in milliseconds."),
+            (("turbo",),       10, "🌀", "Turborepo. Monorepo task runner. You manage multiple packages."),
+            (("nx",),          10, "🅰️",  "Nx. Monorepo orchestrator. Enterprise-scale frontend."),
+            (("rome",),         8, "🏛️",  "Rome (legacy). You were early to Biome's predecessor."),
+        ]
+        self.apply_rules(rules)
+
+    def check_release_and_packaging(self):
+        """Distribution craftsmanship — anyone who packages software properly is rare."""
+        rules = [
+            (("goreleaser",),       16, "📦", "GoReleaser. Multi-arch release pipelines. You ship binaries professionally."),
+            (("cargo-release",),    14, "🦀", "cargo-release. Reliable Rust crate publishing."),
+            (("cargo-dist",),       14, "🦀", "cargo-dist. Multi-platform Rust binary releases. Modern."),
+            (("dpkg-buildpackage",), 14, "📦", "Debian package builder. You actually maintain .deb packages. Distro-grade."),
+            (("rpmbuild",),         14, "📦", "rpmbuild. Red Hat package builder. Enterprise-distro literacy."),
+            (("fpm",),              14, "📦", "fpm. Universal package builder. Pragmatic packaging maximalist."),
+            (("nfpm",),             12, "📦", "nfpm. Go package builder. Modern."),
+            (("pkgbuild",),         16, "🏹", "pkgbuild. Arch package builder. AUR contributor energy."),
+            (("conan",),            12, "🏛️",  "Conan. C/C++ package manager. You wrangle native deps for a living."),
+            (("vcpkg",),            10, "🪟", "vcpkg. Microsoft's C/C++ package manager. Cross-platform native dev."),
+            (("docker-buildx",),    10, "🐳", "docker buildx. Multi-arch image builds. ARM64 ready."),
+            (("ko",),               14, "🥷", "ko. Container images for Go without Dockerfiles. Minimalist DevOps."),
+            (("buildah",),          14, "🛠️",  "buildah. Daemonless container builds. You moved past Docker daemon."),
+            (("skopeo",),           12, "🚚", "skopeo. Container image transfer. Registry power user."),
+            (("dive",),             10, "🤿", "dive. Container layer explorer. You audit your images."),
+        ]
+        self.apply_rules(rules)
+
+    def check_extended_editor_signals(self):
+        """Plugin managers and editor depth — distinguishes posers from power users."""
+        # tmux plugin manager
+        if dir_exists(HOME / ".tmux" / "plugins" / "tpm"):
+            self.award(10, "🪟", "tmux plugin manager (tpm). You configure tmux beyond defaults.")
+        if file_exists(HOME / ".tmux.conf"):
+            content = read_file_safe(HOME / ".tmux.conf")
+            lines = len(content.splitlines())
+            if lines > 100:
+                self.award(12, "🪟", f"tmux.conf with {lines} lines. Your prefix isn't C-b. Power user.")
+            elif lines > 20:
+                self.award(6, "🪟", f"tmux.conf with {lines} lines. Customized.")
+
+        # Neovim plugin manager depth
+        nvim_share = HOME / ".local" / "share" / "nvim"
+        nvim_data = HOME / ".local" / "state" / "nvim"
+        plugin_signals = [
+            (nvim_share / "lazy",   "lazy.nvim"),
+            (nvim_share / "site" / "pack" / "packer", "packer.nvim"),
+            (nvim_share / "site" / "autoload" / "plug.vim", "vim-plug"),
+            (HOME / ".config" / "nvim" / "lazy-lock.json", "lazy.nvim lockfile"),
+        ]
+        for path, name in plugin_signals:
+            if path.exists():
+                self.award(8, "📝", f"Neovim with {name}. Plugin-managed, lockfile-aware.")
+                break
+
+        # LSPs configured
+        mason_dir = HOME / ".local" / "share" / "nvim" / "mason"
+        if mason_dir.is_dir():
+            servers = [d for d in (mason_dir / "packages").glob("*") if d.is_dir()] if (mason_dir / "packages").is_dir() else []
+            if len(servers) > 5:
+                self.award(14, "🧰", f"Mason-managed LSP/DAP servers: {len(servers)}. You wired up real IDE features in nvim.")
+
+        # VSCode workspaces
+        vsc_settings = HOME / ".vscode" / "settings.json"
+        if vsc_settings.exists():
+            self.award(2, "💙", "VSCode settings.json present. Configured beyond defaults.")
+
+        # JetBrains family
+        jb_dirs = list(HOME.glob(".config/JetBrains/*")) + list(HOME.glob("Library/Application Support/JetBrains/*"))
+        if jb_dirs:
+            self.award(4, "🧠", f"JetBrains IDE detected ({len(jb_dirs)} profile(s)). Pragmatic, well-resourced developer.")
+
+        # Sublime Text
+        if cmd_exists("subl"):
+            self.award(4, "🟧", "Sublime Text. Quietly fast editor. Veteran-tier choice.")
+        # Zed
+        if cmd_exists("zed"):
+            self.award(12, "🌌", "Zed. Modern Rust-based editor. You actually try new things.")
+        # Cursor / Windsurf
+        if cmd_exists("cursor"):
+            self.award(6, "🤖", "Cursor. AI-first editor. You collaborate with the model.")
+        if cmd_exists("windsurf"):
+            self.award(6, "🌬️",  "Windsurf. AI editor. You're testing the future.")
+
+        # Lazygit / lazy* family
+        if cmd_exists("lazygit"):
+            self.award(10, "🌳", "lazygit. Git TUI. You commit faster than you think.")
+        if cmd_exists("gitui"):
+            self.award(10, "🌲", "gitui. Rust git TUI. You picked the speed-first option.")
+
+    def check_hardware_and_environment(self):
+        """The machine itself — workstation-class signals."""
+        cpu_count = os.cpu_count() or 0
+        if cpu_count >= 32:
+            self.award(15, "🧠", f"{cpu_count} logical CPUs. Workstation-class hardware. You compile for a living.")
+        elif cpu_count >= 16:
+            self.award(8, "🧠", f"{cpu_count} logical CPUs. Beefy dev machine.")
+        elif cpu_count >= 8:
+            self.award(3, "🧠", f"{cpu_count} logical CPUs. Solid baseline.")
+        self.profile["cpu_count"] = cpu_count
+
+        # RAM — best-effort cross-platform
+        ram_gb = self._detect_ram_gb()
+        if ram_gb:
+            if ram_gb >= 64:
+                self.award(15, "💾", f"~{ram_gb} GB RAM. Your IDE has elbow room. ML or VM workloads suspected.")
+            elif ram_gb >= 32:
+                self.award(8, "💾", f"~{ram_gb} GB RAM. Comfortable for modern dev.")
+            self.profile["ram_gb"] = ram_gb
+
+        # GPU presence — confident detection
+        gpu_signals = []
+        if cmd_exists("nvidia-smi"):
+            out = run("nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null", timeout=4)
+            if out:
+                gpus = [g.strip() for g in out.splitlines() if g.strip()]
+                if gpus:
+                    self.award(12, "🎮", f"NVIDIA GPU(s) detected: {', '.join(gpus[:2])}. CUDA-capable workstation.")
+                    gpu_signals.extend(gpus)
+        if is_macos():
+            mac_chip = run("sysctl -n machdep.cpu.brand_string 2>/dev/null", timeout=2)
+            if "apple" in mac_chip.lower():
+                self.award(8, "🍏", f"{mac_chip.strip()}. Apple Silicon. Metal-capable, MLX-curious.")
+                gpu_signals.append(mac_chip.strip())
+        if is_linux() and cmd_exists("lspci"):
+            lspci = run("lspci 2>/dev/null", timeout=3).lower()
+            if "amd" in lspci and ("radeon" in lspci or "rdna" in lspci):
+                self.award(10, "🎮", "AMD discrete GPU detected. ROCm-curious or gamer-developer.")
+                gpu_signals.append("amd-gpu")
+        self.profile["gpu_signals"] = gpu_signals
+
+        # Multiple displays env hint (Linux)
+        if is_linux() and cmd_exists("xrandr"):
+            out = run("xrandr --listmonitors 2>/dev/null", timeout=3)
+            if out:
+                m = re.search(r"Monitors:\s*(\d+)", out)
+                if m and int(m.group(1)) >= 2:
+                    self.award(6, "🖥️",  f"{m.group(1)} monitors connected. Multi-display productivity setup.")
+
+        # Battery → laptop signal
+        bat_dir = Path("/sys/class/power_supply")
+        if bat_dir.is_dir():
+            if any(p.name.startswith("BAT") for p in bat_dir.iterdir()):
+                self.profile["form_factor"] = "laptop"
+
+    def _detect_ram_gb(self) -> Optional[int]:
+        try:
+            if is_linux() or is_wsl():
+                meminfo = read_file_safe("/proc/meminfo")
+                m = re.search(r"MemTotal:\s+(\d+)\s+kB", meminfo)
+                if m:
+                    return int(m.group(1)) // (1024 * 1024)
+            if is_macos():
+                bytes_str = run("sysctl -n hw.memsize 2>/dev/null", timeout=2)
+                if bytes_str.isdigit():
+                    return int(bytes_str) // (1024 ** 3)
+            if is_windows():
+                out = run('powershell -NoProfile -Command "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory"', timeout=4)
+                if out.strip().isdigit():
+                    return int(out.strip()) // (1024 ** 3)
+        except Exception:
+            return None
+        return None
+
+    def check_ai_dev_workflow(self):
+        """AI-assisted development — modern workflow signals."""
+        if cmd_exists("claude"):
+            self.award(14, "🤖", "Claude Code CLI. AI-pair-programming, terminal-native. Modern workflow confirmed.")
+        if cmd_exists("gh-copilot") or cmd_exists("github-copilot-cli"):
+            self.award(8, "🤖", "GitHub Copilot CLI. AI-assisted shell.")
+        if cmd_exists("aider"):
+            self.award(12, "🛠️",  "aider. Terminal AI pair programmer. You ship with the model.")
+        if cmd_exists("cody"):
+            self.award(8, "🤖", "Cody (Sourcegraph). Code-aware AI assistant.")
+        if cmd_exists("continue"):
+            self.award(8, "↪️",  "Continue. Open-source AI coding agent. You self-host your assistant.")
+        if cmd_exists("codex"):
+            self.award(10, "📜", "OpenAI Codex CLI. Terminal AI agent.")
+
+    def check_combo_bonuses(self):
+        """Cross-cutting bonuses — proves the system is greater than its parts."""
+        prof = self.profile
+
+        langs = set(prof.get("languages", []))
+        if "rustc" in langs and prof.get("os") in ("nixos", "arch"):
+            self.award(10, "🦀", "Rust + (Arch | NixOS) combo. Peak modern hacker stack. Quiet flex confirmed.")
+        if "ghc" in langs and "nix" in prof.get("package_managers", []):
+            self.award(15, "λ", "Haskell + Nix. Reproducible functional programming pipeline. You read POPL papers.")
+        if {"ocaml", "rustc"} <= langs:
+            self.award(8, "🐪", "OCaml + Rust. Compiler-construction enthusiast.")
+        if {"go", "rustc"} <= langs:
+            self.award(5, "🐹", "Go + Rust. Pragmatist and purist living in the same body.")
+        if "ollama" in (prof.get("databases", []) + list(langs)) or cmd_exists("ollama"):
+            if any(cmd_exists(c) for c in ("nvidia-smi", "rocm-smi")):
+                self.award(10, "🤖", "Local LLMs + GPU detected. Self-hosted AI stack.")
+        if prof.get("os") == "nixos" and cmd_exists("home-manager"):
+            self.award(15, "❄️", "NixOS + home-manager. End-to-end declarative system. You can rebuild from a flake.")
+        if cmd_exists("nvim") and cmd_exists("tmux") and cmd_exists("fzf"):
+            self.award(8, "🧙", "nvim + tmux + fzf trifecta. The terminal-native developer's loadout.")
+        if cmd_exists("git") and cmd_exists("gh") and cmd_exists("lazygit"):
+            self.award(6, "🐙", "git + gh + lazygit. PR workflow without leaving the terminal.")
 
     def run_all(self):
         """Run all checks."""
@@ -1044,6 +1719,7 @@ class DevScanner:
             ("📦  Package Managers",            self.check_package_managers),
             ("💻  Programming Languages",       self.check_languages),
             ("🌿  Git & Version Control",       self.check_git),
+            ("🪼  Alt VCS",                      self.check_alternative_vcs),
             ("🐳  Docker & DevOps",             self.check_docker_and_devops),
             ("🔧  Terminal Tools",              self.check_terminal_tools),
             ("⚙️   Shell Customization",        self.check_shell_customization),
@@ -1055,7 +1731,25 @@ class DevScanner:
             ("⚙️   Compilers & Low Level",      self.check_compilers_and_low_level),
             ("🔐  Security Tools",              self.check_security_tools),
             ("🤖  AI & ML Tools",               self.check_ai_ml_tools),
+            ("🤖  AI Dev Workflow",             self.check_ai_dev_workflow),
+            ("🐘  Databases",                   self.check_databases),
+            ("🌐  Web Servers & Proxies",        self.check_web_servers_and_proxies),
+            ("🔭  Observability",                self.check_observability),
+            ("🧪  Testing & Quality",            self.check_testing_and_quality),
+            ("📝  Documentation Tools",          self.check_documentation_tools),
+            ("🌌  Niche Languages",              self.check_more_languages),
+            ("📡  Messaging & Streaming",        self.check_messaging_and_streaming),
+            ("📱  Mobile & Game Dev",            self.check_mobile_and_game_dev),
+            ("🌊  Data Engineering",             self.check_data_engineering),
+            ("🛰️   Advanced Networking",         self.check_advanced_networking),
+            ("🛡️   Privacy & VPN",               self.check_privacy_and_vpn),
+            ("🗒️   Note-taking & Productivity",  self.check_note_taking_and_productivity),
+            ("🦖  Browsers & Web Stack",         self.check_browsers_and_web_stack),
+            ("📦  Release & Packaging",          self.check_release_and_packaging),
+            ("🧰  Editor Plugins & Depth",       self.check_extended_editor_signals),
+            ("🧠  Hardware & Environment",       self.check_hardware_and_environment),
             ("🔮  Legendary & Mythical",        self.check_legendary_stuff),
+            ("✨  Combo Bonuses",                self.check_combo_bonuses),
         ]
 
         print(f"\n{C_CYAN}{BOLD}{'─' * 60}{RESET}")
@@ -1072,12 +1766,15 @@ class DevScanner:
 # RANKING ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 
+C_ASCENDED = "\033[95m"   # bright magenta
+C_COSMIC   = "\033[96m"   # bright cyan
+
 RANKS = [
     # (min_score, name, color, subtitle, description, ascii_art)
     (-999, "SLOP",     C_SLOP,
      "🗑️ The Bloatware Enthusiast",
-     "You have more telemetry than code. Your system is purely corporate slop.\n"
-     "   Please, install a package manager that isn't built by an ad agency.",
+     "You have more telemetry than code. Your system is corporate slop end-to-end.\n"
+     "   Install a package manager that wasn't built by an ad agency.",
      """
    ╔═══════════╗
    ║   SLOP    ║
@@ -1089,7 +1786,7 @@ RANKS = [
     (0,   "COMMON",    C_COMMON,
      "💀 The Muggle Developer",
      "You exist. You code. You Google everything. Stack Overflow is your pair-programmer.\n"
-     "   Your code works, but you don't know why. That's fine. Most production code is like that.",
+     "   Your code works and you don't know why. So does most production code. Welcome.",
      """
    ╔═══════════╗
    ║  COMMON   ║
@@ -1098,7 +1795,7 @@ RANKS = [
    ║  ░░░░░░░  ║
    ╚═══════════╝"""),
 
-    (50,  "UNCOMMON",  C_UNCOMMON,
+    (60,  "UNCOMMON",  C_UNCOMMON,
      "🐣 The Aspiring Nerd",
      "You've installed a real package manager. You have opinions about text editors.\n"
      "   You've told someone 'have you tried Linux?' at least once this year.",
@@ -1110,7 +1807,7 @@ RANKS = [
    ║  ▒▒▒▒▒▒▒▒▒  ║
    ╚══════════════╝"""),
 
-    (150, "RARE",      C_RARE,
+    (180, "RARE",      C_RARE,
      "🧙 The Terminal Dweller",
      "You live in the terminal. Your dotfiles have their own GitHub repo.\n"
      "   You've configured vim. You know what tmux is. Your peers fear your knowledge.",
@@ -1122,10 +1819,10 @@ RANKS = [
    ║  ▓▓▓▓▓▓▓▓▓▓  ║
    ╚═══════════════╝"""),
 
-    (300, "EPIC",      C_EPIC,
+    (350, "EPIC",      C_EPIC,
      "🔮 The Unix Philosopher",
-     "You have a tiling window manager. Your prompt shows your git branch AND battery level.\n"
-     "   You've built your own shell scripts. 'It's not bloat, it's minimalism.' — You, probably.",
+     "You have a tiling window manager. Your prompt shows git branch AND battery level.\n"
+     "   You've written shell scripts that write shell scripts. Minimalism is not bloat.",
      """
    ╔═══════════════╗
    ║     EPIC      ║
@@ -1134,11 +1831,11 @@ RANKS = [
    ║  ████████████ ║
    ╚═══════════════╝"""),
 
-    (500, "LEGENDARY", C_LEGENDARY,
+    (600, "LEGENDARY", C_LEGENDARY,
      "⚡ The 10x Myth, Made Real",
-     "You compile things from source. You have multiple cross-compilers. Your .zshrc is longer\n"
-     "   than most novels. You've written a custom kernel module. People ask you for advice\n"
-     "   and you speak in cryptic profundities. You are the wizard the legends spoke of.",
+     "You compile things from source. You have cross-compilers for chips you don't own.\n"
+     "   Your .zshrc is longer than most novels. You've written a kernel module.\n"
+     "   People ask you for advice and you reply with man-page citations.",
      """
    ╔════════════════╗
    ║  LEGENDARY ⚡  ║
@@ -1147,12 +1844,11 @@ RANKS = [
    ║  ██████████████║
    ╚════════════════╝"""),
 
-    (800, "MYTHICAL",  C_MYTHICAL,
+    (900, "MYTHICAL",  C_MYTHICAL,
      "🌌 The Ascended Being",
-     "You are beyond human classification. You write theorem provers as a hobby.\n"
-     "   You use APL or J. You compile your own compilers. You run Gentoo or BSD or Plan 9.\n"
-     "   You have proven the correctness of your software with Coq.\n"
-     "   NASA has considered hiring you. The kernel mailing list knows your name.",
+     "You write theorem provers as a hobby. You use APL or J. You compile your own compilers.\n"
+     "   You run Gentoo, BSD, or Plan 9. You've proven your software correct in Coq.\n"
+     "   The kernel mailing list knows your name.",
      """
    ╔══════════════════════╗
    ║  ✨ MYTHICAL ✨       ║
@@ -1160,6 +1856,32 @@ RANKS = [
    ║  ░  🌌 BEYOND 🌌  ░  ║
    ║  ▓░▒█▓░▒█▓░▒█▓░▒█▓  ║
    ╚══════════════════════╝"""),
+
+    (1300, "ASCENDED", C_ASCENDED,
+     "🛸 The Standards Track Author",
+     "Your system is fully reproducible from a flake. You contribute to the languages you use.\n"
+     "   You've shipped a package to a distro you helped maintain. You speak in RFCs.\n"
+     "   You don't read changelogs — they cite you.",
+     """
+   ╔══════════════════════════╗
+   ║  🛸  ASCENDED  🛸         ║
+   ║  ░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░  ║
+   ║  ▓  REPRODUCIBLE  ▓     ║
+   ║  ░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░  ║
+   ╚══════════════════════════╝"""),
+
+    (1800, "COSMIC",   C_COSMIC,
+     "🌠 The Compiler Itself",
+     "You are not a developer. You are an environment that emits developers.\n"
+     "   Your dotfiles are a Turing machine. Your text editor has its own kernel.\n"
+     "   Somewhere in production, a service runs because you blinked at it.",
+     """
+   ╔══════════════════════════╗
+   ║  🌠  COSMIC  🌠           ║
+   ║  ✦ ✶ ✷ ✸ ✹ ✺ ✦ ✶ ✷  ║
+   ║  ✷  T H E   ALL  ✷       ║
+   ║  ✦ ✶ ✷ ✸ ✹ ✺ ✦ ✶ ✷  ║
+   ╚══════════════════════════╝"""),
 ]
 
 def get_rank(score: int):
@@ -1220,9 +1942,9 @@ def print_warnings(warnings: List[str]):
     for w in warnings:
         print(f"  {C_YELLOW}⚠️  {w}{RESET}")
 
-def print_score_bar(score: int, max_score: int = 1000):
+def print_score_bar(score: int, max_score: int = 2000):
     width = 50
-    # Clamping the bar visual to 0 even if the score is negative to prevent weird rendering
+    # Clamp negatives to 0 so the bar renders sanely.
     filled = max(0, min(int((score / max_score) * width), width))
     empty = width - filled
     _, name, color, *_ = get_rank(score)
@@ -1284,6 +2006,16 @@ def print_final_rank(score: int, findings_count: int):
             "You don't write code. You write proofs that happen to be executable.",
             "The machine knows your name. The machine fears you.",
         ],
+        "ASCENDED": [
+            "Your `nix flake check` passes on architectures that don't exist yet.",
+            "The standards body sent you flowers. You composted them and used the receipt as a CI artifact.",
+            "Your IDE is a window manager. Your window manager is a build system. The build system is you.",
+        ],
+        "COSMIC": [
+            "You don't have a development environment. You ARE the development environment.",
+            "Your shell prompt has more uptime than your cloud provider.",
+            "Somewhere, a kernel panic is politely waiting for your approval to occur.",
+        ],
     }
 
     print(f"\n  {C_CYAN}{ITALIC}» {random.choice(roasts.get(name, ['You are unique. The scanner doesn\'t know what to say.']))}{RESET}")
@@ -1297,7 +2029,7 @@ def print_final_rank(score: int, findings_count: int):
 def main():
     print_banner()
 
-    print(f"  {C_GRAY}System: {platform.system()} {platform.machine()} | Python {platform.python_version()}{RESET}")
+    print(f"  {C_GRAY}System: {host_label()} {platform.machine()} | Python {platform.python_version()}{RESET}")
     print(f"  {C_GRAY}Home: {HOME}{RESET}")
     print(f"\n  {C_YELLOW}Starting deep scan of your developer soul...{RESET}")
     print(f"  {C_GRAY}(No data leaves your machine. Unlike that npm package you installed yesterday.){RESET}")
@@ -1309,8 +2041,8 @@ def main():
     # Sort findings by points descending
     scanner.findings.sort(key=lambda x: x[0], reverse=True)
 
-    # Print findings (top 40 most interesting)
-    top_findings = scanner.findings[:60]
+    # Print top findings — show more now that there are many more checks.
+    top_findings = scanner.findings[:100]
     print_findings(top_findings)
 
     # Warnings
