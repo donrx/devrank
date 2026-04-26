@@ -10,9 +10,12 @@ python devrank.py
 ```
 
 ## Rarity:
+- Slop
 - Common
 - Uncommon
 - Rare
 - Epic
 - Legendary
 - Mythical
+- Ascended
+- Cosmic
