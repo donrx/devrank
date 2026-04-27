@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║         DEV RARITY SCANNER v1.2 — "What Kind of Dev Are You?"  ║
-║     Inspired by the sacred scrolls of r/ProgrammerHumor,        ║
-║     r/unixporn, r/linux, and the deep lore of the internet.     ║
+║         DEV RARITY SCANNER v1.2 — "What Kind of Dev Are You?"    ║
+║     Inspired by the sacred scrolls of r/ProgrammerHumor,         ║
+║     r/unixporn, r/linux, and the deep lore of the internet.      ║
 ╚══════════════════════════════════════════════════════════════════╝
 
 Scans your computer and ranks your developer rarity from:
