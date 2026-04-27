@@ -7,7 +7,7 @@
 ╚══════════════════════════════════════════════════════════════════╝
 
 Scans your computer and ranks your developer rarity from:
-  Slop → Common → Uncommon → Rare → Epic → Legendary → Mythical
+  Common → Uncommon → Rare → Epic → Legendary → Mythical
 
 No data leaves your machine. This is 100% local. We promise.
 (Unlike that npm package you installed at 2am without reading.)
@@ -40,7 +40,6 @@ DIM     = "\033[2m"
 ITALIC  = "\033[3m"
 
 # Rank colors
-C_SLOP      = "\033[31m"      # Red
 C_COMMON    = "\033[37m"      # Gray/white
 C_UNCOMMON  = "\033[32m"      # Green
 C_RARE      = "\033[34m"      # Blue
@@ -320,6 +319,10 @@ class DevScanner:
         self.findings: List[Tuple[int, str, str]] = []  # (points, emoji, message)
         self.warnings: List[str] = []
         self.profile: Dict[str, any] = {}
+        # Tracks how many awards have been made per category for diminishing returns.
+        # Each additional award in a category is scaled by 1/(1 + n*decay),
+        # a hyperbolic decay that compresses bulk tool-stacking without hard caps.
+        self._category_counts: Dict[str, int] = {}
 
     def award(self, points: int, emoji: str, msg: str):
         self.score += points
@@ -329,20 +332,58 @@ class DevScanner:
         self.score -= points
         self.findings.append((-points, emoji, msg))
 
+    def category_award(self, category: str, points: int, emoji: str, msg: str, decay: float = 0.25):
+        """Award points with hyperbolic diminishing returns within a category.
+
+        The n-th award in *category* is multiplied by:
+            factor(n) = 1 / (1 + n * decay)
+        where n starts at 0.  This is a well-defined harmonic-series decay that
+        asymptotically approaches zero, preventing any single bulk category from
+        dominating the score regardless of how many tools a user has installed.
+
+        Example with decay=0.25 and base=8:
+            n=0 → 8  (100 %)
+            n=1 → 6  ( 80 %)
+            n=2 → 5  ( 67 %)
+            n=4 → 4  ( 50 %)
+            n=9 → 2  ( 29 %)
+            n=19→ 1  ( 17 %)
+        """
+        n = self._category_counts.get(category, 0)
+        factor = 1.0 / (1.0 + n * decay)
+        effective = max(1, round(points * factor))
+        self.award(effective, emoji, msg)
+        self._category_counts[category] = n + 1
+
+    def category_penalize(self, category: str, points: int, emoji: str, msg: str, decay: float = 0.25):
+        """Penalize with the same hyperbolic diminishing returns."""
+        n = self._category_counts.get(category, 0)
+        factor = 1.0 / (1.0 + n * decay)
+        effective = max(1, round(points * factor))
+        self.penalize(effective, emoji, msg)
+        self._category_counts[category] = n + 1
+
     def warn(self, msg: str):
         self.warnings.append(msg)
 
     def has(self, *commands: str) -> bool:
         return any(cmd_exists(command) for command in commands)
 
-    def apply_rules(self, rules: List[Tuple[Tuple[str, ...], int, str, str]], collector: Optional[List[str]] = None):
+    def apply_rules(self, rules: List[Tuple[Tuple[str, ...], int, str, str]], collector: Optional[List[str]] = None,
+                    category: Optional[str] = None, decay: float = 0.25):
         for commands, points, emoji, msg in rules:
             command_tuple = (commands,) if isinstance(commands, str) else commands
             if self.has(*command_tuple):
-                if points >= 0:
-                    self.award(points, emoji, msg)
+                if category:
+                    if points >= 0:
+                        self.category_award(category, points, emoji, msg, decay)
+                    else:
+                        self.category_penalize(category, abs(points), emoji, msg, decay)
                 else:
-                    self.penalize(abs(points), emoji, msg)
+                    if points >= 0:
+                        self.award(points, emoji, msg)
+                    else:
+                        self.penalize(abs(points), emoji, msg)
                 if collector is not None:
                     collector.append(command_tuple[0])
 
@@ -379,9 +420,9 @@ class DevScanner:
             distro_lower = distro.lower()
             linux_rules = [
                 (lambda: match_any(distro_lower, ("arch",)), 25, "🏹", "arch", f"Arch Linux! Don't worry, we already know. You've told everyone."),
-                (lambda: match_any(distro_lower, ("gentoo",)), 40, "🔮", "gentoo", f"Gentoo! You compile everything from source including your morning coffee."),
+                (lambda: match_any(distro_lower, ("gentoo",)), 30, "🔮", "gentoo", f"Gentoo! You compile everything from source including your morning coffee."),
                 (lambda: match_any(distro_lower, ("nix",)) or file_exists("/etc/nixos"), 35, "❄️", "nixos", f"NixOS detected. Your system.nix is longer than most novels."),
-                (lambda: match_any(distro_lower, ("bsd",)) or SYSTEM == "FreeBSD", 45, "🦌", "bsd", f"BSD! You are either very wise or very lost. Possibly both."),
+                (lambda: match_any(distro_lower, ("bsd",)) or SYSTEM == "FreeBSD", 35, "🦌", "bsd", f"BSD! You are either very wise or very lost. Possibly both."),
                 (lambda: match_any(distro_lower, ("ubuntu",)), 10, "🐧", "ubuntu", f"{distro}. The 'I use Linux btw' starter pack. Comfortable."),
                 (lambda: match_any(distro_lower, ("debian",)), 12, "🌀", "debian", f"Debian. Stable. Boring. Like you. (Compliment.)"),
                 (lambda: match_any(distro_lower, ("fedora",)), 14, "🎩", "fedora", f"Fedora. For people who want Arch clout but also want their GPU drivers to work."),
@@ -434,7 +475,7 @@ class DevScanner:
         editors_found = []
         
         if cmd_exists("eclipse"):
-            self.penalize(15, "☕", "Eclipse installed. Your RAM is crying. Peak enterprise slop.")
+            self.category_penalize("editors", 15, "☕", "Eclipse installed. Your RAM is crying. Peak enterprise slop.")
             editors_found.append("eclipse")
 
         if cmd_exists("nvim"):
@@ -449,13 +490,13 @@ class DevScanner:
                 packer = dir_exists(HOME / ".local" / "share" / "nvim" / "site" / "pack" / "packer")
                 plug = file_exists(HOME / ".local" / "share" / "nvim" / "site" / "autoload" / "plug.vim")
                 if lazy or packer or plug:
-                    self.award(28, "📝", "Neovim with plugins! You spent 3 days configuring and 1 hour coding.")
+                    self.category_award("editors", 28, "📝", "Neovim with plugins! You spent 3 days configuring and 1 hour coding.")
                     editors_found.append("nvim_configured")
                 else:
-                    self.award(20, "📝", "Neovim installed with config. You're on the path. The path hurts.")
+                    self.category_award("editors", 20, "📝", "Neovim installed with config. You're on the path. The path hurts.")
                     editors_found.append("nvim_config")
             else:
-                self.award(10, "📝", "Neovim installed but no real config. You're a vim poser. It's okay, we won't tell.")
+                self.category_award("editors", 10, "📝", "Neovim installed but no real config. You're a vim poser. It's okay, we won't tell.")
                 editors_found.append("nvim_bare")
 
         if cmd_exists("vim") or cmd_exists("vi"):
@@ -466,43 +507,43 @@ class DevScanner:
                     content = read_file_safe(vimrc) + read_file_safe(vim_cfg)
                     line_count = len(content.splitlines())
                     if line_count > 100:
-                        self.award(20, "🧙", f"Vim with {line_count}-line .vimrc. You are a wizard. A slightly unhinged one.")
+                        self.category_award("editors", 20, "🧙", f"Vim with {line_count}-line .vimrc. You are a wizard. A slightly unhinged one.")
                     else:
-                        self.award(12, "🧙", "Vim with config. You know :wq without Googling. Respect.")
+                        self.category_award("editors", 12, "🧙", "Vim with config. You know :wq without Googling. Respect.")
                 else:
-                    self.award(2,  "🧙", "Vim installed but no .vimrc. Standard issue OS.")
+                    self.category_award("editors", 2, "🧙", "Vim installed but no .vimrc. Standard issue OS.")
 
         if cmd_exists("emacs"):
             emacs_cfg = [HOME / ".emacs", HOME / ".emacs.d" / "init.el", HOME / ".config" / "emacs" / "init.el"]
             doom = dir_exists(HOME / ".config" / "doom")
             spacemacs = dir_exists(HOME / ".spacemacs.d")
             if doom:
-                self.award(30, "👿", "Doom Emacs. You use Emacs as an OS and Vim keybindings inside it. Maximum chaos.")
+                self.category_award("editors", 25, "👿", "Doom Emacs. You use Emacs as an OS and Vim keybindings inside it. Maximum chaos.")
             elif spacemacs:
-                self.award(25, "🚀", "Spacemacs. You wanted both Emacs and Vim and chose violence.")
+                self.category_award("editors", 20, "🚀", "Spacemacs. You wanted both Emacs and Vim and chose violence.")
             elif any(Path(p).exists() for p in emacs_cfg):
-                self.award(22, "🧓", "Emacs with config. M-x butterfly. You are timeless.")
+                self.category_award("editors", 22, "🧓", "Emacs with config. M-x butterfly. You are timeless.")
             else:
-                self.award(5,  "🧓", "Emacs installed. Did you run M-x doctor yet?")
+                self.category_award("editors", 5, "🧓", "Emacs installed. Did you run M-x doctor yet?")
 
         if cmd_exists("code"):
-            self.award(4, "💙", "VSCode installed. You are not a programmer; you are a 'software engineer'.")
+            self.category_award("editors", 4, "💙", "VSCode installed. You are not a programmer; you are a 'software engineer'.")
             ext_path = HOME / ".vscode" / "extensions"
             if ext_path.exists():
                 n_ext = len([d for d in ext_path.iterdir() if d.is_dir()])
                 if n_ext > 50:
-                    self.penalize(5, "💙", f"VSCode with {n_ext} extensions! It's basically a full, bloated OS at this point.")
+                    self.category_penalize("editors", 5, "💙", f"VSCode with {n_ext} extensions! It's basically a full, bloated OS at this point.")
                 elif n_ext > 20:
-                    self.award(2, "💙", f"VSCode with {n_ext} extensions. Building a collection.")
+                    self.category_award("editors", 2, "💙", f"VSCode with {n_ext} extensions. Building a collection.")
 
         if cmd_exists("nano"):
-            self.penalize(5, "🍌", "Nano is installed. The training wheels never came off.")
+            self.category_penalize("editors", 5, "🍌", "Nano is installed. The training wheels never came off.")
 
         if cmd_exists("hx"):
-            self.award(18, "💎", "Helix editor! You're a trendsetter. Or you read too many Rust blogs.")
+            self.category_award("editors", 18, "💎", "Helix editor! You're a trendsetter. Or you read too many Rust blogs.")
 
         if cmd_exists("micro"):
-            self.award(3, "🔬", "Micro editor. Nano but you wanted more without committing to vim.")
+            self.category_award("editors", 3, "🔬", "Micro editor. Nano but you wanted more without committing to vim.")
 
     def check_package_managers(self):
         """Package managers: the measure of a developer's chaos."""
@@ -514,9 +555,9 @@ class DevScanner:
             (("apt", "apt-get"), 2, "📦", "APT package manager (Debian/Ubuntu). Stable and standard."),
             (("pacman",), 10, "👻", "Pacman! You are one 'yay -Syu' away from an existential crisis."),
             (("yay", "paru"), 8, "🏹", "AUR helper detected! You install software that 3 people maintain from their basement."),
-            (("emerge",), 30, "🔮", "Portage/emerge! You compile packages during lunch. You are Gentoo."),
+            (("emerge",), 20, "🔮", "Portage/emerge! You compile packages during lunch. You are Gentoo."),
             (("cargo",), 12, "🦀", "Cargo installed! You've mentioned Rust at least 7 times this week."),
-        ], pms)
+        ], pms, category="pkgmgr", decay=0.30)
 
         if cmd_exists("brew"):
             pkgs = run("brew list --formula 2>/dev/null | wc -l").strip()
@@ -579,11 +620,11 @@ class DevScanner:
             (("tcl",), 18, "🐍", "Tcl! You are from a different timeline entirely. installed."),
             (("sbcl",), 28, "λ", "Common Lisp (SBCL)! Parentheses all the way down. installed."),
             (("racket",), 20, "🎾", "Racket! You took a PL theory class and never recovered. installed."),
-            (("fortran",), 30, "🦕", "Fortran! You are either 80 years old or doing numerical computing. installed."),
-            (("cobol",), 35, "🏦", "COBOL! Banks pay you more than God. installed."),
+            (("fortran",), 25, "🦕", "Fortran! You are either 80 years old or doing numerical computing. installed."),
+            (("cobol",), 30, "🏦", "COBOL! Banks pay you more than God. installed."),
             (("ada",), 30, "✈️", "Ada! Aviation? Defense? You care if planes stay in the sky. installed."),
             (("fpc",), 22, "🎠", "Pascal/FPC! Legendary. Nostalgic. Chaotic. installed."),
-        ], langs)
+        ], langs, category="languages", decay=0.20)
         self.profile["languages"] = langs
 
     def check_git(self):
@@ -677,7 +718,7 @@ class DevScanner:
             ("wrangler",6, "☁️",  "Wrangler CLI. Cloudflare Workers. Edge computing evangelist."),
         ]:
             if cmd_exists(cloud):
-                self.award(pts, emoji, msg)
+                self.category_award("devops_cloud", pts, emoji, msg, decay=0.30)
                 clouds.append(cloud)
         self.profile["clouds"] = clouds
 
@@ -737,18 +778,18 @@ class DevScanner:
             ("xxd",          3,  "🔢", "xxd! Hex dump tool. You speak bytes."),
         ]
         
-        self.apply_rules([((cmd,), pts, emoji, msg) for cmd, pts, emoji, msg in tools])
+        self.apply_rules([((cmd,), pts, emoji, msg) for cmd, pts, emoji, msg in tools], category="terminal_tools", decay=0.25)
                 
         # Exclusive checks to prevent double-point bloat
         if self.has("eza"):
-            self.award(8, "📁", "eza! ls replacement. Color, icons, git status. Maximum customization.")
+            self.category_award("terminal_tools", 8, "📁", "eza! ls replacement. Color, icons, git status. Maximum customization.")
         elif self.has("exa"):
-            self.award(6, "📁", "exa (old eza)! You care about ls output. Respectable.")
+            self.category_award("terminal_tools", 6, "📁", "exa (old eza)! You care about ls output. Respectable.")
 
         if self.has("curl"):
-            self.award(2, "🌐", "curl. The original API tester.")
+            self.category_award("terminal_tools", 2, "🌐", "curl. The original API tester.")
         if self.has("wget"):
-            self.award(2, "📥", "wget. You download files like a person of culture.")
+            self.category_award("terminal_tools", 2, "📥", "wget. You download files like a person of culture.")
 
     def check_shell_customization(self):
         """How deep does the rabbit hole go?"""
@@ -873,9 +914,9 @@ class DevScanner:
             wm_checks = [
                 ("i3",       25, "🪟", "i3wm! Tiling window manager. You tile everything. Even your thoughts."),
                 ("sway",     28, "🌊", "Sway! i3 for Wayland. You're on the bleeding edge. It occasionally cuts."),
-                ("hyprland", 30, "💫", "Hyprland! Wayland compositor. Your animations are smoother than your social skills."),
+                ("hyprland", 25, "💫", "Hyprland! Wayland compositor. Your animations are smoother than your social skills."),
                 ("bspwm",    25, "🌳", "bspwm! Binary space partitioning. You organize windows like a BST."),
-                ("dwm",      35, "⚙️",  "dwm! Dynamic window manager. You compiled your WM from source. On brand."),
+                ("dwm",      30, "⚙️",  "dwm! Dynamic window manager. You compiled your WM from source. On brand."),
                 ("qtile",    22, "🐍", "Qtile! Tiling WM in Python. You configure your WM with code."),
                 ("awesome",  25, "🌟", "Awesome WM! Lua-configured tiling. Dual name — ironically true."),
                 ("xmonad",   30, "λ",  "XMonad! Haskell-configured WM. You write type-safe window tiling logic."),
@@ -886,7 +927,7 @@ class DevScanner:
             ]
             for cmd, pts, emoji, msg in wm_checks:
                 if cmd_exists(cmd):
-                    self.award(pts, emoji, msg)
+                    self.category_award("wm", pts, emoji, msg, decay=0.40)
 
             if os.environ.get("WAYLAND_DISPLAY"):
                 self.award(10, "🌊", "Running Wayland! You've moved on from X11. Brave new world.")
@@ -903,7 +944,7 @@ class DevScanner:
             ("ghostty",  12, "👻", "Ghostty! The hottest new terminal. You read tech Twitter."),
         ]:
             if cmd_exists(term):
-                self.award(pts, emoji, msg)
+                self.category_award("terminal_emu", pts, emoji, msg, decay=0.40)
 
     def check_fonts_and_ricing(self):
         """r/unixporn would approve."""
@@ -1710,6 +1751,122 @@ class DevScanner:
         if cmd_exists("git") and cmd_exists("gh") and cmd_exists("lazygit"):
             self.award(6, "🐙", "git + gh + lazygit. PR workflow without leaving the terminal.")
 
+    def check_2026_meta(self):
+        """The current year energy. Fresh off r/ProgrammerHumor, still warm."""
+
+        # Zed editor — the 2025-26 "I switched from VSCode" flex
+        if cmd_exists("zed") or dir_exists(HOME / ".config" / "zed"):
+            self.award(18, "⚡", "Zed editor! GPU-accelerated, Rust-native, Electron-free. You read the benchmarks and felt something.")
+
+        # uv — Astral's Python package manager that replaced pip+poetry+pyenv in one shot
+        if cmd_exists("uv"):
+            self.award(15, "🚀", "uv! Astral's Rust-based Python tool. You replaced pip, virtualenv, AND pyenv with one binary. Correct.")
+
+        # ruff — Astral's linter/formatter, killed black+flake8 overnight
+        if cmd_exists("ruff"):
+            self.award(10, "🦀", "ruff! Rust-based Python linter. 100x faster than flake8. You didn't debate it, you just switched.")
+
+        # atuin — shell history with sync, search, and stats. The 2025 upgrade everyone made
+        if cmd_exists("atuin"):
+            self.award(12, "🔍", "atuin! Shell history that actually works — synced, searchable, and stats. Ctrl+R was a crime before this.")
+
+        # opencode — terminal-based AI coding agent (the serious alternative to cursor)
+        if cmd_exists("opencode"):
+            self.award(14, "🤖", "opencode! Terminal AI coding agent. You run your AI assistant in the CLI like a person of culture.")
+
+        # The "Coding Monk" 2026 bonus — can you still code without AI?
+        has_any_ai_tool = any(cmd_exists(c) for c in ("cursor", "aider", "opencode", "claude", "copilot"))
+        has_real_tools  = sum([
+            cmd_exists("nvim") or cmd_exists("vim"),
+            cmd_exists("gdb") or cmd_exists("lldb"),
+            cmd_exists("valgrind") or cmd_exists("heaptrack"),
+            cmd_exists("make") or cmd_exists("cmake"),
+            cmd_exists("rustc") or cmd_exists("gcc") or cmd_exists("clang"),
+        ])
+        if not has_any_ai_tool and has_real_tools >= 3:
+            self.award(20, "🧘", "No AI coding tools detected. In 2026 that's either a lifestyle choice or an achievement. "
+                               "r/ProgrammerHumor calls your kind 'coding monks'. Rare. Possibly feral.")
+
+        # The "localhost:3000 deployer" — vibe coder with no actual infra knowledge
+        has_infra = any(cmd_exists(c) for c in ("kubectl", "terraform", "ansible", "docker", "fly", "wrangler", "vercel"))
+        has_cursor = dir_exists(HOME / ".cursor") or dir_exists(HOME / ".config" / "Cursor")
+        if has_cursor and not has_infra:
+            self.penalize(8, "🌐", "Cursor installed but zero deployment tools found. "
+                                   "Your app works on localhost:3000. Ship it sometime.")
+            self.warn("localhost:3000 deployer detected. The world cannot access your masterpiece.")
+
+    def check_vibe_coding(self):
+        """The 2025 meme that broke r/ProgrammerHumor."""
+        # Detect vibe-coding tools
+        has_cursor   = dir_exists(HOME / ".cursor") or dir_exists(HOME / ".config" / "Cursor")
+        has_copilot  = cmd_exists("gh") and file_exists(HOME / ".config" / "gh" / "hosts.yml") and \
+                       file_contains(str(HOME / ".config" / "gh" / "hosts.yml"), "github.com")
+        has_claude_code = cmd_exists("claude")
+        has_aider    = cmd_exists("aider")
+        has_continue = dir_exists(HOME / ".continue")
+
+        if has_cursor:
+            self.award(3, "🖱️",  "Cursor IDE detected. Welcome to vibe coding. Your LLM does the typing; you do the vibing.")
+        if has_aider:
+            self.award(12, "🤖", "aider! Terminal-based AI pair programmer. You AI-assist without leaving the CLI. Respectable.")
+        if has_continue:
+            self.award(8,  "⚡", ".continue config found! Continue.dev in your editor. You have AI autocomplete and you're not ashamed.")
+        if has_claude_code:
+            self.award(15, "🟣", "claude (Claude Code) detected! You let an AI agent run commands on your machine. Either genius or brave.")
+
+        # Penalise pure vibe coder: has Cursor but zero terminal AI tooling
+        if has_cursor and not (has_aider or has_claude_code or has_continue):
+            self.penalize(5, "😴", "Cursor-only vibe coder. No terminal AI tooling at all. You click buttons and call it engineering.")
+            self.warn("Pure Cursor user with no CLI AI tools. r/ProgrammerHumor is watching.")
+
+    def check_modern_ricing(self):
+        """2025 r/unixporn meta: Niri, Quickshell, swww, and color scheme theology."""
+        # Niri — the scrollable-tiling Wayland compositor blowing up in 2025-26
+        if cmd_exists("niri"):
+            self.award(30, "📜", "Niri compositor! Scrollable tiling for Wayland. PaperWM energy. r/unixporn's new darling.")
+
+        # Quickshell — QML-based shell framework replacing eww/AGS
+        if cmd_exists("quickshell") or dir_exists(HOME / ".config" / "quickshell"):
+            self.award(22, "⚡", "Quickshell config detected! QML-based desktop shell. You replaced waybar with a framework. Certified ricer.")
+
+        # swww — animated Wayland wallpaper daemon
+        if cmd_exists("swww") or cmd_exists("swww-daemon"):
+            self.award(10, "🖼️", "swww! Smooth animated wallpapers on Wayland. Your desktop transitions are silkier than your git history.")
+
+        # wallust — colorscheme generator from wallpapers (newer pywal)
+        if cmd_exists("wallust"):
+            self.award(14, "🎨", "wallust! Next-gen pywal. Your colorscheme is auto-generated from your wallpaper. Peak rice autonomy.")
+
+        # matugen — Material You color generator
+        if cmd_exists("matugen"):
+            self.award(12, "🎨", "matugen! Material You theming from wallpaper. Your desktop looks like a Google Pixel. Intentionally.")
+
+        # Color scheme theology — check dotfiles for the holy grails
+        rc_contents = ""
+        for rc in get_shell_rc_files():
+            rc_contents += read_file_safe(rc)
+        cfg_dir = HOME / ".config"
+        for cfg_file in ["hypr/hyprland.conf", "waybar/style.css", "kitty/kitty.conf",
+                         "alacritty/alacritty.toml", "alacritty/alacritty.yml",
+                         "nvim/init.lua", "nvim/init.vim"]:
+            rc_contents += read_file_safe(cfg_dir / cfg_file)
+
+        theme_hits = []
+        for theme, emoji in [
+            ("catppuccin", "🐈"), ("gruvbox", "🟤"), ("nord", "❄️"),
+            ("dracula", "🧛"), ("tokyo", "🌃"), ("rose-pine", "🌹"),
+            ("everforest", "🌲"), ("kanagawa", "🎐"), ("onedark", "🔵"),
+        ]:
+            if theme in rc_contents.lower():
+                theme_hits.append(f"{emoji} {theme.title()}")
+
+        if len(theme_hits) >= 3:
+            self.award(15, "🎨", f"Multi-theme dotfiles: {', '.join(theme_hits[:3])} — and more. You have opinions. Strong ones.")
+        elif len(theme_hits) == 2:
+            self.award(10, "🎨", f"Color scheme devotion: {', '.join(theme_hits)}. You pick your editor theme like a religion.")
+        elif len(theme_hits) == 1:
+            self.award(6,  "🎨", f"Color scheme: {theme_hits[0]}. You have taste. Singular, but taste.")
+
     def run_all(self):
         """Run all checks."""
         checks = [
@@ -1750,6 +1907,9 @@ class DevScanner:
             ("🧠  Hardware & Environment",       self.check_hardware_and_environment),
             ("🔮  Legendary & Mythical",        self.check_legendary_stuff),
             ("✨  Combo Bonuses",                self.check_combo_bonuses),
+            ("🤖  Vibe Coding",                 self.check_vibe_coding),
+            ("🍚  Modern Ricing (2025)",        self.check_modern_ricing),
+            ("📅  2026 Meta",                   self.check_2026_meta),
         ]
 
         print(f"\n{C_CYAN}{BOLD}{'─' * 60}{RESET}")
@@ -1766,34 +1926,19 @@ class DevScanner:
 # RANKING ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 
-C_ASCENDED = "\033[95m"   # bright magenta
-C_COSMIC   = "\033[96m"   # bright cyan
-
 RANKS = [
     # (min_score, name, color, subtitle, description, ascii_art)
-    (-999, "SLOP",     C_SLOP,
-     "🗑️ The Bloatware Enthusiast",
-     "You have more telemetry than code. Your system is corporate slop end-to-end.\n"
-     "   Install a package manager that wasn't built by an ad agency.",
-     """
-   ╔═══════════╗
-   ║   SLOP    ║
-   ║  🗑️🗑️🗑️  ║
-   ║  🔥📉🔥  ║
-   ║  🗑️🗑️🗑️  ║
-   ╚═══════════╝"""),
-
     (0,   "COMMON",    C_COMMON,
      "💀 The Muggle Developer",
      "You exist. You code. You Google everything. Stack Overflow is your pair-programmer.\n"
      "   Your code works and you don't know why. So does most production code. Welcome.",
      """
-   ╔═══════════╗
-   ║  COMMON   ║
-   ║  ░░░░░░░  ║
-   ║  ░ 💻 ░  ║
-   ║  ░░░░░░░  ║
-   ╚═══════════╝"""),
+   ╔════════════╗
+   ║   COMMON   ║
+   ║  ░░░░░░░░  ║
+   ║  ░  💻  ░  ║
+   ║  ░░░░░░░░  ║
+   ╚════════════╝"""),
 
     (60,  "UNCOMMON",  C_UNCOMMON,
      "🐣 The Aspiring Nerd",
@@ -1801,10 +1946,10 @@ RANKS = [
      "   You've told someone 'have you tried Linux?' at least once this year.",
      """
    ╔══════════════╗
-   ║  UNCOMMON    ║
-   ║  ▒▒▒▒▒▒▒▒▒  ║
-   ║  ▒  🐧  ▒  ║
-   ║  ▒▒▒▒▒▒▒▒▒  ║
+   ║   UNCOMMON   ║
+   ║  ▒▒▒▒▒▒▒▒▒▒  ║
+   ║  ▒   🐧   ▒  ║
+   ║  ▒▒▒▒▒▒▒▒▒▒  ║
    ╚══════════════╝"""),
 
     (180, "RARE",      C_RARE,
@@ -1812,24 +1957,24 @@ RANKS = [
      "You live in the terminal. Your dotfiles have their own GitHub repo.\n"
      "   You've configured vim. You know what tmux is. Your peers fear your knowledge.",
      """
-   ╔═══════════════╗
-   ║     RARE      ║
+   ╔══════════════╗
+   ║     RARE     ║
    ║  ▓▓▓▓▓▓▓▓▓▓  ║
-   ║  ▓  🧙‍♂️  ▓  ║
+   ║  ▓   🧙‍♂️   ▓  ║
    ║  ▓▓▓▓▓▓▓▓▓▓  ║
-   ╚═══════════════╝"""),
+   ╚══════════════╝"""),
 
     (350, "EPIC",      C_EPIC,
      "🔮 The Unix Philosopher",
      "You have a tiling window manager. Your prompt shows git branch AND battery level.\n"
      "   You've written shell scripts that write shell scripts. Minimalism is not bloat.",
      """
-   ╔═══════════════╗
-   ║     EPIC      ║
-   ║  ████████████ ║
+   ╔══════════════╗
+   ║     EPIC     ║
+   ║  ██████████  ║
    ║  █   🔮   █  ║
-   ║  ████████████ ║
-   ╚═══════════════╝"""),
+   ║  ██████████  ║
+   ╚══════════════╝"""),
 
     (600, "LEGENDARY", C_LEGENDARY,
      "⚡ The 10x Myth, Made Real",
@@ -1837,12 +1982,12 @@ RANKS = [
      "   Your .zshrc is longer than most novels. You've written a kernel module.\n"
      "   People ask you for advice and you reply with man-page citations.",
      """
-   ╔════════════════╗
-   ║  LEGENDARY ⚡  ║
-   ║  ██████████████║
-   ║  ██  ⚡🦅⚡  ██║
-   ║  ██████████████║
-   ╚════════════════╝"""),
+   ╔══════════════════╗
+   ║    LEGENDARY     ║
+   ║  ██████████████  ║
+   ║  ██  ⚡🦅⚡    ██  ║
+   ║  ██████████████  ║
+   ╚══════════════════╝"""),
 
     (900, "MYTHICAL",  C_MYTHICAL,
      "🌌 The Ascended Being",
@@ -1851,37 +1996,12 @@ RANKS = [
      "   The kernel mailing list knows your name.",
      """
    ╔══════════════════════╗
-   ║  ✨ MYTHICAL ✨       ║
-   ║  ▓░▒█▓░▒█▓░▒█▓░▒█▓  ║
-   ║  ░  🌌 BEYOND 🌌  ░  ║
-   ║  ▓░▒█▓░▒█▓░▒█▓░▒█▓  ║
+   ║    ✨ MYTHICAL ✨    ║
+   ║  ▓░▒█▓░▒█▓░▒█▓░▒█▓░  ║
+   ║  ░  🌌 BEYOND 🌌  ▓  ║
+   ║  ▓░▒█▓░▒█▓░▒█▓░▒█▓░  ║
    ╚══════════════════════╝"""),
 
-    (1300, "ASCENDED", C_ASCENDED,
-     "🛸 The Standards Track Author",
-     "Your system is fully reproducible from a flake. You contribute to the languages you use.\n"
-     "   You've shipped a package to a distro you helped maintain. You speak in RFCs.\n"
-     "   You don't read changelogs — they cite you.",
-     """
-   ╔══════════════════════════╗
-   ║  🛸  ASCENDED  🛸         ║
-   ║  ░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░  ║
-   ║  ▓  REPRODUCIBLE  ▓     ║
-   ║  ░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░  ║
-   ╚══════════════════════════╝"""),
-
-    (1800, "COSMIC",   C_COSMIC,
-     "🌠 The Compiler Itself",
-     "You are not a developer. You are an environment that emits developers.\n"
-     "   Your dotfiles are a Turing machine. Your text editor has its own kernel.\n"
-     "   Somewhere in production, a service runs because you blinked at it.",
-     """
-   ╔══════════════════════════╗
-   ║  🌠  COSMIC  🌠           ║
-   ║  ✦ ✶ ✷ ✸ ✹ ✺ ✦ ✶ ✷  ║
-   ║  ✷  T H E   ALL  ✷       ║
-   ║  ✦ ✶ ✷ ✸ ✹ ✺ ✦ ✶ ✷  ║
-   ╚══════════════════════════╝"""),
 ]
 
 def get_rank(score: int):
@@ -1971,50 +2091,41 @@ def print_final_rank(score: int, findings_count: int):
 
     # Roast / encouragement
     roasts = {
-        "SLOP": [
-            "We detected more bloat on your system than actual code.",
-            "Please uninstall Eclipse and try again.",
-            "Sir, this is a proprietary disaster.",
-        ],
         "COMMON": [
-            "Your terminal is black. That's the one good thing you've done.",
-            "Keep going. The vim tutorial is waiting.",
-            "Everyone starts somewhere. You started here. Godspeed.",
+            "bro opened terminal once by accident and now he's here. actual skill issue 💀",
+            "king of downloading vscode and calling yourself a dev. we see you. we judge you.",
+            "you have python installed because a tutorial told you to. respect the journey. (it's a short journey.)",
+            "ngl this is kinda rough. like we've seen worse but it's close.",
         ],
         "UNCOMMON": [
-            "You've installed Homebrew. You've tasted freedom. There's no going back.",
-            "You're on the path. The path involves compiling things for no reason.",
-            "You installed Linux once. You reinstalled it six times. Progress.",
+            "ok so you installed homebrew. do you want a trophy or something?? 😭",
+            "you're the guy who reinstalls linux every weekend and still hasn't shipped anything lmaooo",
+            "you told someone 'have you tried linux' this week. we both know it. they haven't texted back.",
+            "participation trophy dev. not in a mean way. well. a little.",
         ],
         "RARE": [
-            "Your .zshrc is longer than your relationships.",
-            "You've customized your terminal prompt. You've peaked. And also just begun.",
-            "You said 'have you tried Linux?' to someone this week. I can tell.",
+            "dotfiles repo has 3 stars and two of them are you on alt accounts. we respect the commitment tho.",
+            "unironically spends more time ricing than coding 😭 based and also concerning",
+            "you said btw i use arch and it wasn't even a joke was it. it wasn't.",
+            "your zshrc is longer than your last relationship and you care about it more too.",
         ],
         "EPIC": [
-            "Your window manager has no title bars and you call it efficiency.",
-            "You've written a shell script that makes other shell scripts. Inception.",
-            "People ask you for advice. You give them man pages. Correct.",
+            "no titlebar havers rise up. also touch grass once in a while it's free.",
+            "bro wrote a shell script that generates shell scripts. we're not the same. genuinely not the same.",
+            "you explained your window manager to someone who didn't ask. they smiled and nodded. they were scared.",
+            "rice so hard you forgot to ship anything. the ricing was the product all along 🙏",
         ],
         "LEGENDARY": [
-            "You understand why the kernel is written in C. You have opinions about it.",
-            "Your dotfiles have their own CI/CD pipeline.",
-            "You compiled your terminal emulator from source. On purpose.",
+            "your dotfiles have their own CI/CD pipeline. your plants do not. they are deceased.",
+            "compiled your terminal emulator FROM SOURCE. on purpose. with custom flags. we're in awe and also worried.",
+            "man page citations as advice to friends. they stopped asking. you kept citing. based.",
+            "your .zshrc has comments explaining the comments. this is a medical condition.",
         ],
         "MYTHICAL": [
-            "Linus Torvalds has responded to your email. Once. You saved it.",
-            "You don't write code. You write proofs that happen to be executable.",
-            "The machine knows your name. The machine fears you.",
-        ],
-        "ASCENDED": [
-            "Your `nix flake check` passes on architectures that don't exist yet.",
-            "The standards body sent you flowers. You composted them and used the receipt as a CI artifact.",
-            "Your IDE is a window manager. Your window manager is a build system. The build system is you.",
-        ],
-        "COSMIC": [
-            "You don't have a development environment. You ARE the development environment.",
-            "Your shell prompt has more uptime than your cloud provider.",
-            "Somewhere, a kernel panic is politely waiting for your approval to occur.",
+            "you are not a developer. you are a cautionary tale AND a deity. coexisting. somehow.",
+            "linus replied to your email once. you framed it. it's above your monitor. you eat dinner looking at it.",
+            "bro writes theorem provers for FUN. for FUN. sir what is wrong with you. (nothing. everything. both.)",
+            "the kernel mailing list knows your name and emails you to ask questions. this is canon.",
         ],
     }
 
